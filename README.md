@@ -143,4 +143,22 @@ Faculty of Engineering, Mansoura University, Egypt
 
 ## 📜 License
 
-MIT License — see [LICENSE](LICENSE) for details.
+Copyright (c) 2026 Mahmoud A. ELAMiR
+Faculty of Engineering, Mansoura University, Egypt
+
+All Rights Reserved.
+
+This software and associated documentation files (the "Software")
+are the intellectual property of Mahmoud A. ELAMiR.
+
+Permission is hereby granted for:
+- Academic review and evaluation purposes only
+- Citation in academic papers with proper attribution
+
+The following are strictly prohibited without written permission:
+- Commercial use
+- Redistribution or republication
+- Modification for derivative works
+- Patent filing based on this work
+
+For licensing inquiries: mahmoudahmedelamir@std.mans.edu.eg
