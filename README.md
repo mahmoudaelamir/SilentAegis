@@ -135,8 +135,9 @@ UAV Position Output
 Faculty of Engineering, Mansoura University, Egypt
 
 **Supervisors:**
+- Assoc. Prof. Doaa A. Altantawy
 - Dr. Seham Abd-Elsamee
-- Dr. Doaa A. Altantawy
+
 
 ---
 
