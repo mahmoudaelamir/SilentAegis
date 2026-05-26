@@ -80,7 +80,7 @@ print(f"Position: X={position_xy[0,0]:.3f}m, Y={position_xy[0,1]:.3f}m")
 
 ## 📡 Dataset
 
-Real hardware validation uses the **Oryx ISAC Dataset** (TU Ilmenau, 2025):
+Real hardware validation uses the **Oryx ISAC Dataset** (TU Ilmenau, 2026):
 - **FC:** 3.75 GHz | **BW:** 48 MHz | **Δr:** 3.13 m
 - **Hardware:** USRP X310 SDR
 - **Target:** VTOL UAV | **Samples:** 625 synchronized
@@ -116,13 +116,13 @@ UAV Position Output
 ## 📝 Citation
 
 ```bibtex
-@article{elamir2025silentaegis,
+@article{elamir2026silentaegis,
   title={SilentAegis: Hybrid Ray-Tracing Passive Radar for 6G ISAC:
          Physics-Informed Neural Network with Sparse Sionna Calibration
          and Unscented Kalman Filter Tracking},
   author={ELAMiR, Mahmoud A.},
   journal={IEEE Access},
-  year={2025},
+  year={2026},
   institution={Faculty of Engineering, Mansoura University}
 }
 ```
