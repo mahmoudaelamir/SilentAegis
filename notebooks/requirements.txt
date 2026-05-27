@@ -1,0 +1,25 @@
+# SilentAegis — Requirements
+# pip install -r requirements.txt
+
+# Core
+torch>=2.0.0
+numpy>=1.24.0
+
+# Real Hardware Dataset
+h5py>=3.8.0
+scipy>=1.10.0
+
+# Kalman Filter
+filterpy>=1.4.5
+
+# ONNX Deployment
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Optional: Sionna RT Calibration
+# sionna==2.0.1
+# drjit
+# mitsuba
