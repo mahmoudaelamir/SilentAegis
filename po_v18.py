@@ -1241,6 +1241,7 @@ class App:
         self.last_clicked_bnd=None; self.last_valid_price=1.15000
         self.last_bet=10.0; self.adx_val=None
         self._stop_price=False; self._last_real_fetch=0; self._api_ok=True
+        self._consec_dir=None; self._consec_count=0  # consecutive signal tracker
 
         self.v_pair=tk.StringVar(value="EUR/USD OTC")
         self.v_dur =tk.StringVar(value="1m")
@@ -1556,6 +1557,7 @@ class App:
         self.sym=PAIRS.get(self.v_pair.get(),"EURUSD=X")
         self.builder=CandleBuilder(CANDLE_DUR.get(self.v_dur.get(),60))
         self.direction=None; self.pending_trades.clear()
+        self._consec_dir=None; self._consec_count=0
         self.lbl_sig.config(text="⏳ Scanning...",fg="#222",bg="#050810")
         self.lbl_conf.config(text=""); self.lbl_reason.config(text="")
         self.cv.delete("all"); self._last_real_fetch=0
@@ -1610,8 +1612,34 @@ class App:
 
         d,c,r,s,cf=self.engine.run_all(cs,crypto=is_crypto)
 
+        # ── Market Structure Gate ────────────────────────────────────────────
+        # Check if price is making HH/HL (uptrend) or LH/LL (downtrend)
+        if len(cs)>=6:
+            recent_highs=[c_["h"] for c_ in cs[-6:]]
+            recent_lows =[c_["l"] for c_ in cs[-6:]]
+            ms_up  = recent_highs[-1]>recent_highs[-3] and recent_lows[-1]>recent_lows[-3]
+            ms_down= recent_highs[-1]<recent_highs[-3] and recent_lows[-1]<recent_lows[-3]
+            # Block signals that contradict confirmed market structure
+            if is_crypto:
+                if ms_down and d=="CALL" and c<75: d="PUT"; c=max(52,c-10)
+                if ms_up   and d=="PUT"  and c<75: d="CALL"; c=max(52,c-10)
+        # ────────────────────────────────────────────────────────────────────
+
+        # ── Consecutive Signal Lock ──────────────────────────────────────────
+        # If same direction repeats too many times, require higher confidence
+        if d==self._consec_dir:
+            self._consec_count+=1
+        else:
+            self._consec_dir=d; self._consec_count=1
+        consec_limit=4 if is_crypto else 5
+        if self._consec_count>consec_limit and c<72:
+            # Force a "waiting" state — signal too repetitive
+            d=self.direction; c=52; r="Waiting for new signal..."; s="Wait"; cf=0
+        # ────────────────────────────────────────────────────────────────────
+
         # Adjust by session + ADX
-        c=max(50,min(95,int(c*smult)))
+        conf_cap=85 if is_crypto else 95
+        c=max(50,min(conf_cap,int(c*smult)))
         if not adx_ok and self.adx_val is not None: c=int(c*0.80)
 
         # ML adjustment
@@ -1621,7 +1649,7 @@ class App:
 
         # AI trust bonus
         wr=self.brain.get_wr(s)
-        if wr>=65: c=min(95,c+int((wr-50)*0.20))
+        if wr>=65: c=min(conf_cap,c+int((wr-50)*0.20))
 
         bet,cb_msg=self.risk.get_bet(c,smult,cf)
         self.last_bet=bet
@@ -1651,8 +1679,9 @@ class App:
         self.lbl_besthour.config(text=self.risk.best_hour())
 
         cf_gate=4 if is_crypto else 3
+        consec_tag=f" x{self._consec_count}" if self._consec_count>2 else ""
         confl_clr="#00ff88" if cf>=cf_gate+2 else ("#ffaa00" if cf>=cf_gate else "#666")
-        self.lbl_confl.config(text=f"CF:{cf} signals{'⚡' if is_crypto else ''}",fg=confl_clr)
+        self.lbl_confl.config(text=f"CF:{cf} signals{'⚡' if is_crypto else ''}{consec_tag}",fg=confl_clr)
 
         # Scanner row
         scan_txt=self.scanner.summary()
