@@ -1797,6 +1797,7 @@ class PocketOptionTrader:
 
     def _ws_loop(self):
         url=self.WS_DEMO if self.is_demo else self.WS_LIVE
+        # Send full ci_session cookie value as-is
         self._ws=websocket.WebSocketApp(
             url,
             on_open   =self._on_open,
@@ -1808,28 +1809,27 @@ class PocketOptionTrader:
         self._ws.run_forever(ping_interval=20,ping_timeout=10)
 
     def _on_open(self,ws):
-        # Socket.IO handshake — send auth after receiving "0" (open packet)
-        pass
+        # Send Socket.IO namespace connect immediately on open
+        ws.send("40")
 
     def _on_message(self,ws,msg):
         try:
-            # Socket.IO protocol: messages start with a number prefix
-            if msg.startswith("0"):
-                # Connected — authenticate with SSID
-                auth=json.dumps({"ssid":self.ssid,"is_demo":1 if self.is_demo else 0})
-                ws.send(f'40{auth}')
+            if msg.startswith("0") and not msg.startswith("40"):
+                # Engine.IO open — namespace connect already sent in _on_open
+                pass
             elif msg.startswith("40"):
-                # Auth confirmed
-                self._connected=True; self.enabled=True
-                self.status=f"✅ Connected ({'Demo' if self.is_demo else 'Live'})"
-                # Request balance
-                ws.send('42["sendMessage",{"action":"changeSymbol","message":{"asset":"EURUSD_otc","period":60}}]')
+                # Namespace connected — now send auth event
+                auth_payload=json.dumps(["auth",{
+                    "session": self.ssid,
+                    "isDemo":  1 if self.is_demo else 0
+                }])
+                ws.send(f"42{auth_payload}")
             elif msg.startswith("42"):
                 data=json.loads(msg[2:])
                 self._handle_event(data)
             elif msg=="2":
                 ws.send("3")  # pong
-        except Exception as e:
+        except Exception:
             pass
 
     def _handle_event(self,data):
@@ -2277,8 +2277,8 @@ class App:
                   relief="flat",command=_check_bal,padx=8,pady=4).pack(side="left",padx=4)
         tk.Button(br,text="Disconnect",bg="#1a0a0a",fg="#ff4444",font=("Consolas",9),
                   relief="flat",command=_disconnect,padx=8,pady=4).pack(side="left",padx=4)
-        tk.Label(win,text="⚠ SSID = ci_session cookie من المتصفح (F12 → Application → Cookies)",
-                 bg="#050810",fg="#445",font=("Consolas",6)).pack(pady=2)
+        tk.Label(win,text="⚠ SSID = القيمة الكاملة لـ ci_session من Cookies (F12 → Application → Cookies → انسخ Value كاملاً)",
+                 bg="#050810",fg="#445",font=("Consolas",6),wraplength=400).pack(pady=2)
 
     def _tg_settings(self):
         win=tk.Toplevel(self.root)
