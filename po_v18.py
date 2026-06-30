@@ -990,6 +990,192 @@ class PatternValidator:
         return acc,total
 
 # ══════════════════════════════════════════════════════════
+#  ConsensusEngine — One Decision Per Candle, Only When Certain
+# ══════════════════════════════════════════════════════════
+class ConsensusEngine:
+    """
+    Quant-grade entry filter.
+    Accumulates analysis votes across closed candles.
+    Entry fires ONLY in the first 8 seconds of the next candle
+    when all gates are satisfied.
+    """
+
+    def __init__(self, required_votes=3, min_confidence=82, min_cf=5,
+                 min_pro_agree=3, min_pattern_acc=0.60, cooldown_candles=2):
+        self.required_votes   = required_votes
+        self.min_confidence   = min_confidence
+        self.min_cf           = min_cf
+        self.min_pro_agree    = min_pro_agree
+        self.min_pattern_acc  = min_pattern_acc
+        self.cooldown_candles = cooldown_candles
+
+        self._votes: list     = []
+        self._entry_ready     = False
+        self._entry_direction = None
+        self._entry_conf      = 0
+        self._entry_cf        = 0
+        self._entry_reason    = ""
+        self._vote_str        = "⏳ Init..."
+        self._candles_since_trade = cooldown_candles   # start ready
+
+    # ── called once per candle close ────────────────────────────────────────
+    def on_candle_close(self, engine, candles, pro_modules,
+                        pattern_validator, crypto, regime_detector,
+                        session_sq) -> dict:
+        conf_cap = 85 if crypto else 93
+
+        try:
+            d, c, r, s, cf = engine.run_all(candles, crypto=crypto)
+        except Exception:
+            return {"status": "error", "vote_str": "⚠ Engine error", "dir": None, "conf": 0, "cf": 0}
+
+        # VOLATILE regime → skip vote
+        regime = regime_detector.detect(candles)
+        if regime == RegimeDetector.VOLATILE:
+            self._entry_ready = False
+            self._vote_str = "⚡ VOLATILE — skip"
+            return {"status": "volatile", "vote_str": self._vote_str, "dir": d, "conf": c, "cf": cf}
+
+        # Pro module signals
+        pro_agree = 0
+        cur_price = candles[-1]["c"] if candles else 0
+        if crypto:
+            checks = []
+            try: checks.append(pro_modules["ob"].signal())
+            except: pass
+            try: checks.append(pro_modules["fr"].signal())
+            except: pass
+            try: checks.append(pro_modules["mtf"].signal())
+            except: pass
+            try: checks.append(pro_modules["whale"].signal())
+            except: pass
+            try: checks.append(pro_modules["fg"].signal())
+            except: pass
+            try: checks.append(pro_modules["dxy"].signal(d))
+            except: pass
+            try:
+                for vs in pro_modules["vol"].signal(cur_price): checks.append(vs)
+            except: pass
+            for sig in checks:
+                if sig and sig[0] == d and sig[1] >= 65:
+                    pro_agree += 1
+
+        # Pattern validator historical accuracy
+        pat_acc = 0.5
+        if len(candles) >= 30 and c >= 65 and cf >= 3:
+            try:
+                pa, samples = pattern_validator.validate(engine, candles, d, crypto=crypto)
+                if samples >= 5:
+                    pat_acc = pa
+            except Exception:
+                pass
+
+        # Weighted composite score (0–100)
+        pro_ratio  = min(1.0, pro_agree / max(1, self.min_pro_agree)) if crypto else 1.0
+        core_norm  = min(1.0, c / conf_cap)
+        sess_norm  = min(1.0, session_sq / 100.0)
+        weighted   = int(core_norm * 40 + pro_ratio * 30 + pat_acc * 20 + sess_norm * 10)
+
+        vote = {"dir": d, "conf": c, "cf": cf, "pro_agree": pro_agree,
+                "pat_acc": pat_acc, "sq": session_sq, "regime": regime,
+                "weighted": weighted, "reason": r}
+        self._votes.append(vote)
+        if len(self._votes) > self.required_votes:
+            self._votes = self._votes[-self.required_votes:]
+
+        return self._evaluate(crypto, conf_cap, d, c, cf)
+
+    def _evaluate(self, crypto, conf_cap, latest_d, latest_c, latest_cf) -> dict:
+        votes = self._votes
+        n = len(votes)
+        if n == 0:
+            self._vote_str = "⏳ No votes"
+            return {"status": "wait", "vote_str": self._vote_str, "dir": latest_d,
+                    "conf": latest_c, "cf": latest_cf}
+
+        dirs     = [v["dir"] for v in votes]
+        call_v   = dirs.count("CALL")
+        put_v    = dirs.count("PUT")
+        dominant = "CALL" if call_v >= put_v else "PUT"
+        agree    = max(call_v, put_v)
+        latest   = votes[-1]
+
+        avg_conf    = sum(v["conf"]      for v in votes) / n
+        avg_cf      = sum(v["cf"]        for v in votes) / n
+        avg_pro     = sum(v["pro_agree"] for v in votes) / n
+        avg_pat     = sum(v["pat_acc"]   for v in votes) / n
+        avg_w       = sum(v["weighted"]  for v in votes) / n
+
+        # Gates
+        full_agree    = agree == n and n >= self.required_votes
+        partial_agree = agree >= n - 1 and n >= 2 and latest["dir"] == dominant
+        g_votes    = full_agree or partial_agree
+        g_conf     = avg_conf >= self.min_confidence
+        g_cf       = avg_cf   >= (self.min_cf if crypto else self.min_cf - 1)
+        g_pro      = avg_pro  >= self.min_pro_agree or not crypto
+        g_pat      = avg_pat  >= self.min_pattern_acc
+        g_regime   = latest["regime"] in (RegimeDetector.TREND, RegimeDetector.RANGE)
+        g_weighted = avg_w    >= 78
+        g_cool     = self._candles_since_trade >= self.cooldown_candles
+
+        all_ok = g_votes and g_conf and g_cf and g_pro and g_pat and g_regime and g_weighted and g_cool
+
+        if all_ok:
+            self._entry_ready     = True
+            self._entry_direction = dominant
+            self._entry_conf      = int(avg_conf)
+            self._entry_cf        = int(avg_cf)
+            self._entry_reason    = latest["reason"]
+            self._vote_str        = (f"✅ {dominant} {agree}/{n} | "
+                                     f"{int(avg_conf)}% CF:{int(avg_cf)} W:{int(avg_w)}%")
+        else:
+            self._entry_ready = False
+            fails = []
+            if not g_votes:   fails.append(f"VOTES:{agree}/{n}")
+            if not g_conf:    fails.append(f"CONF:{int(avg_conf)}<{self.min_confidence}")
+            if not g_cf:      fails.append(f"CF:{int(avg_cf)}")
+            if not g_pro and crypto: fails.append(f"PRO:{int(avg_pro)}<{self.min_pro_agree}")
+            if not g_pat:     fails.append(f"HIST:{int(avg_pat*100)}%<{int(self.min_pattern_acc*100)}%")
+            if not g_regime:  fails.append("VOLATILE")
+            if not g_weighted:fails.append(f"SCORE:{int(avg_w)}<78")
+            if not g_cool:    fails.append(f"COOL:{self._candles_since_trade}/{self.cooldown_candles}")
+            self._vote_str = f"⚠ WAIT — {' | '.join(fails[:3])}"
+
+        return {"status": "entry" if all_ok else "wait",
+                "vote_str": self._vote_str,
+                "dir": dominant, "conf": int(avg_conf), "cf": int(avg_cf),
+                "weighted": int(avg_w)}
+
+    def should_enter(self, builder) -> bool:
+        return self._entry_ready and builder._elapsed() <= 8.0
+
+    def get_current_display(self, live_dir, live_conf, live_cf):
+        if self._entry_ready:
+            return (self._entry_direction, self._entry_conf, self._entry_cf,
+                    True, f"🎯 ENTRY: {self._entry_direction} | {self._vote_str}")
+        return (live_dir, live_conf, live_cf, False,
+                f"⏳ {live_dir} {live_conf}% | {self._vote_str}")
+
+    def reset_after_entry(self):
+        self._entry_ready         = False
+        self._entry_direction     = None
+        self._entry_conf          = 0
+        self._candles_since_trade = 0
+        self._votes.clear()
+
+    def tick_candle(self):
+        if self._candles_since_trade < self.cooldown_candles:
+            self._candles_since_trade += 1
+
+    def reset(self):
+        self._votes.clear()
+        self._entry_ready         = False
+        self._entry_direction     = None
+        self._vote_str            = "⏳ Init..."
+        self._candles_since_trade = self.cooldown_candles
+
+
+# ══════════════════════════════════════════════════════════
 #  Strategy Engine — 22 signal sources
 # ══════════════════════════════════════════════════════════
 class StrategyEngine:
@@ -1779,6 +1965,10 @@ class App:
         self.self_learner=SelfLearner(self.engine)
         self.adaptive_expiry=AdaptiveExpiry()
         self.smart_timer=SmartEntryTimer()
+        self.consensus=ConsensusEngine(
+            required_votes=3, min_confidence=82, min_cf=5,
+            min_pro_agree=3, min_pattern_acc=0.60, cooldown_candles=2)
+        self._consensus_entry_fired=False
         threading.Thread(target=self._pro_data_loop,daemon=True).start()
 
         self.direction=None; self.conf=0; self.reason=""; self.strat_name=""
@@ -2123,6 +2313,7 @@ class App:
         self.builder=CandleBuilder(CANDLE_DUR.get(self.v_dur.get(),60))
         self.direction=None; self.pending_trades.clear()
         self._consec_dir=None; self._consec_count=0
+        self.consensus.reset(); self._consensus_entry_fired=False
         self.lbl_sig.config(text="⏳ Scanning...",fg="#222",bg="#050810")
         self.lbl_conf.config(text=""); self.lbl_reason.config(text="")
         self.cv.delete("all"); self._last_real_fetch=0
@@ -2152,12 +2343,18 @@ class App:
             self.pending_trades=surviving
 
         if n>=8:
-            self._analyze()
-            if new_candle:
-                is_crypto=self.sym.startswith("BINANCE:")
-                d,c,r,s,cf=self.engine.run_all(self.builder.candles(),crypto=is_crypto)
-                self.pending_trades.append(
-                    {"strat":s,"dir":d,"entry":p,"expiry":now+self.builder.dur-3})
+            self._analyze()   # display only — no trade entry inside
+
+        if new_candle and n>=8:
+            self.consensus.tick_candle()
+            self._on_candle_close(p)
+
+        # Entry trigger: first 8 seconds of candle after confirmed consensus vote
+        if (self.auto_click and self.targets_ready and
+                self.consensus.should_enter(self.builder)):
+            if not self._consensus_entry_fired:
+                self._consensus_entry_fired=True
+                self._fire_consensus_entry(p)
 
     def _analyze(self):
         cs=self.builder.candles()
@@ -2331,35 +2528,77 @@ class App:
                 self.lbl_scan.config(text=scan_txt,fg="#445566")
 
         changed=(d!=self.direction)
-        self.direction=d; self.conf=c; self.reason=r
-        self.strat_name=s; self.confluence=cf
+        self.strat_name=s
 
         if changed and d:
             self.history.insert(0,{"d":d,"c":c,
                                     "t":datetime.datetime.now().strftime("%H:%M"),"s":s})
             self.history=self.history[:6]
 
-        # Auto-entry — crypto needs stronger confluence (4+ signals)
-        auto_min=self.v_min_conf_auto.get()
-        ok_conf=c>=auto_min; ok_cf=cf>=(4 if is_crypto else 3)
-        ok_sess=sq>=55; ok_cb=not self.risk.circuit_break
-        ok_profit=not self.risk.profit_locked
-        ok_news=not blocked
+        # ── Consensus display overlay ─────────────────────────────────────────
+        disp_dir,disp_conf,disp_cf,is_armed,status_line=\
+            self.consensus.get_current_display(d,c,cf)
 
-        if (self.auto_click and self.targets_ready and ok_conf and ok_cf and d
-                and ok_sess and ok_cb and ok_profit and ok_news):
-            bnd=self.builder._bnd
-            if self.last_clicked_bnd!=bnd:
-                self.last_clicked_bnd=bnd
+        self.lbl_ml.config(
+            text=f"🤖 {status_line[:56]}",
+            fg="#00ff88" if is_armed else ("#ffaa00" if "WAIT" in status_line else "#888"))
 
-                tgt=self.call_tgt if d=="CALL" else self.put_tgt
-                cx,cy=tgt.center()
-                threading.Thread(target=fire_click,args=(tgt,cx,cy),daemon=True).start()
-
-                # Telegram signal
-                self.tg.send_signal(d,c,r,self.v_pair.get(),bet,cf)
+        self.direction=disp_dir; self.conf=disp_conf; self.reason=r; self.confluence=disp_cf
+        # ─────────────────────────────────────────────────────────────────────
 
         self._draw(changed)
+
+    def _on_candle_close(self, current_price):
+        """Runs ConsensusEngine vote on the just-closed candle."""
+        cs=self.builder.candles()
+        if len(cs)<8: return
+        is_crypto=self.sym.startswith("BINANCE:")
+        sq,sname,smult=session_quality(is_crypto=is_crypto)
+        pro_modules={"ob":self.ob,"fr":self.fr,"oi":self.oi,
+                     "vol":self.vol,"mtf":self.mtf_real,
+                     "whale":self.whale,"fg":self.fg,"dxy":self.dxy}
+        status=self.consensus.on_candle_close(
+            engine=self.engine, candles=cs, pro_modules=pro_modules,
+            pattern_validator=self.pattern_validator, crypto=is_crypto,
+            regime_detector=self.engine._regime_det, session_sq=sq)
+        self._consensus_entry_fired=False
+        vote_str=status.get("vote_str","⏳")
+        is_entry=status.get("status")=="entry"
+        self.lbl_reason.config(
+            text=f"► {vote_str}",
+            fg="#00ff88" if is_entry else ("#ffaa00" if "WAIT" in vote_str else "#555"))
+
+    def _fire_consensus_entry(self, current_price):
+        """Fires click when consensus is fully confirmed."""
+        d   = self.consensus._entry_direction
+        c   = self.consensus._entry_conf
+        cf  = self.consensus._entry_cf
+        r   = self.consensus._entry_reason
+        if not d: return
+        is_crypto=self.sym.startswith("BINANCE:")
+        sq,sname,smult=session_quality(is_crypto=is_crypto)
+        blocked,_=self.news.is_blocked()
+        if self.risk.circuit_break or self.risk.profit_locked or blocked: return
+        bet,cb_msg=self.risk.get_bet(c,smult,cf)
+        if bet<=0: return
+        tgt=self.call_tgt if d=="CALL" else self.put_tgt
+        cx,cy=tgt.center()
+        # Visual confirmation
+        self.lbl_sig.config(
+            text=f"🎯 {'⬆ CALL' if d=='CALL' else '⬇ PUT'}",
+            fg="#00ff88" if d=="CALL" else "#ff4444",
+            bg="#020d05" if d=="CALL" else "#0d0202")
+        self.lbl_conf.config(
+            text=f"ENTRY | {c}% | CF:{cf} | {self.consensus._vote_str}",
+            fg="#00ff88" if d=="CALL" else "#ff4444")
+        threading.Thread(target=fire_click,args=(tgt,cx,cy),daemon=True).start()
+        self.tg.send_signal(d,c,r,self.v_pair.get(),bet,cf)
+        now=time.time()
+        self.pending_trades.append(
+            {"strat":self.strat_name,"dir":d,"entry":current_price,
+             "expiry":now+self.builder.dur-3})
+        self.last_bet=bet
+        self.consensus.reset_after_entry()
 
     def _clock(self):
         now=datetime.datetime.utcnow()
