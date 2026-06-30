@@ -1005,7 +1005,75 @@ def fire_click(tgt,x,y):
 # ══════════════════════════════════════════════════════════
 #  Live Price — supports fast polling
 # ══════════════════════════════════════════════════════════
+# Forex pair → standard currency code (e.g. "EURUSD=X" → "EUR/USD")
+_FX_MAP = {
+    "EURUSD=X":"EUR","GBPUSD=X":"GBP","USDJPY=X":"USD","AUDUSD=X":"AUD",
+    "GBPJPY=X":"GBP","EURJPY=X":"EUR","USDCAD=X":"USD","USDCHF=X":"USD",
+    "NZDUSD=X":"NZD",
+}
+_FX_QUOTE = {
+    "EURUSD=X":"USD","GBPUSD=X":"USD","USDJPY=X":"JPY","AUDUSD=X":"USD",
+    "GBPJPY=X":"JPY","EURJPY=X":"JPY","USDCAD=X":"CAD","USDCHF=X":"CHF",
+    "NZDUSD=X":"USD",
+}
+
+def _yahoo_price(symbol):
+    """Try Yahoo Finance v7 then v8 chart endpoint."""
+    # v7 quote
+    for host in ("query1","query2"):
+        try:
+            url=(f"https://{host}.finance.yahoo.com/v7/finance/quote"
+                 f"?symbols={symbol}&fields=regularMarketPrice,bid&_={int(time.time())}")
+            req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
+            with urllib.request.urlopen(req,timeout=3) as r:
+                d=json.loads(r.read())
+            res=d["quoteResponse"]["result"]
+            if res:
+                p=res[0].get("regularMarketPrice") or res[0].get("bid")
+                if p: return float(p)
+        except: pass
+    # v8 chart fallback
+    try:
+        url=f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=5m"
+        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req,timeout=3) as r:
+            d=json.loads(r.read())
+        closes=d["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        closes=[x for x in closes if x]
+        if closes: return float(closes[-1])
+    except: pass
+    return None
+
+def _frankfurter_price(symbol):
+    """Frankfurter ECB API — free, no key, updates every minute during market hours."""
+    base=_FX_MAP.get(symbol); quote=_FX_QUOTE.get(symbol)
+    if not base or not quote: return None
+    try:
+        url=f"https://api.frankfurter.app/latest?from={base}&to={quote}"
+        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req,timeout=3) as r:
+            d=json.loads(r.read())
+        rate=d.get("rates",{}).get(quote)
+        if rate: return float(rate)
+    except: pass
+    return None
+
+def _exchangerate_price(symbol):
+    """Open ExchangeRate-API — free, no key required."""
+    base=_FX_MAP.get(symbol); quote=_FX_QUOTE.get(symbol)
+    if not base or not quote: return None
+    try:
+        url=f"https://open.er-api.com/v6/latest/{base}"
+        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req,timeout=3) as r:
+            d=json.loads(r.read())
+        rate=d.get("rates",{}).get(quote)
+        if rate: return float(rate)
+    except: pass
+    return None
+
 def live_price(symbol):
+    # ── Binance (crypto) ──────────────────────────────────
     if symbol.startswith("BINANCE:"):
         coin=symbol.split(":")[1]
         try:
@@ -1014,17 +1082,18 @@ def live_price(symbol):
             with urllib.request.urlopen(req,timeout=2) as r:
                 return float(json.loads(r.read())["price"])
         except: return None
-    url=(f"https://query1.finance.yahoo.com/v7/finance/quote"
-         f"?symbols={symbol}&fields=regularMarketPrice,bid&_={int(time.time())}")
-    try:
-        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req,timeout=3) as r: d=json.loads(r.read())
-        res=d["quoteResponse"]["result"]
-        if res:
-            p=res[0].get("regularMarketPrice") or res[0].get("bid")
-            if p: return float(p)
-    except: pass
-    return None
+
+    # ── Commodities (Gold, Oil) ───────────────────────────
+    if symbol in ("GC=F","CL=F"):
+        return _yahoo_price(symbol)
+
+    # ── Forex: try 3 sources in order ────────────────────
+    p=_yahoo_price(symbol)
+    if p: return p
+    p=_frankfurter_price(symbol)
+    if p: return p
+    p=_exchangerate_price(symbol)
+    return p
 
 # ══════════════════════════════════════════════════════════
 #  Main Application
