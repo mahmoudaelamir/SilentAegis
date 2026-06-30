@@ -1005,75 +1005,105 @@ def fire_click(tgt,x,y):
 # ══════════════════════════════════════════════════════════
 #  Live Price — supports fast polling
 # ══════════════════════════════════════════════════════════
-# Forex pair → standard currency code (e.g. "EURUSD=X" → "EUR/USD")
-_FX_MAP = {
-    "EURUSD=X":"EUR","GBPUSD=X":"GBP","USDJPY=X":"USD","AUDUSD=X":"AUD",
-    "GBPJPY=X":"GBP","EURJPY=X":"EUR","USDCAD=X":"USD","USDCHF=X":"USD",
-    "NZDUSD=X":"NZD",
+# ── Symbol maps ───────────────────────────────────────────
+_STOOQ = {
+    "EURUSD=X":"eurusd","GBPUSD=X":"gbpusd","USDJPY=X":"usdjpy",
+    "AUDUSD=X":"audusd","GBPJPY=X":"gbpjpy","EURJPY=X":"eurjpy",
+    "USDCAD=X":"usdcad","USDCHF=X":"usdchf","NZDUSD=X":"nzdusd",
+    "GC=F":"xauusd","CL=F":"cl.f",
 }
-_FX_QUOTE = {
-    "EURUSD=X":"USD","GBPUSD=X":"USD","USDJPY=X":"JPY","AUDUSD=X":"USD",
-    "GBPJPY=X":"JPY","EURJPY=X":"JPY","USDCAD=X":"CAD","USDCHF=X":"CHF",
-    "NZDUSD=X":"USD",
-}
+_FX_BASE  = {"EURUSD=X":"EUR","GBPUSD=X":"GBP","AUDUSD=X":"AUD","NZDUSD=X":"NZD",
+             "USDJPY=X":"USD","GBPJPY=X":"GBP","EURJPY=X":"EUR",
+             "USDCAD=X":"USD","USDCHF=X":"USD"}
+_FX_QUOTE = {"EURUSD=X":"USD","GBPUSD=X":"USD","AUDUSD=X":"USD","NZDUSD=X":"USD",
+             "USDJPY=X":"JPY","GBPJPY=X":"JPY","EURJPY=X":"JPY",
+             "USDCAD=X":"CAD","USDCHF=X":"CHF"}
+
+# Yahoo crumb session cache
+_yf_session = {"crumb":"","cookie":"","ts":0}
+
+def _refresh_yahoo_crumb():
+    """Fetch Yahoo Finance crumb+cookie (required since 2024)."""
+    try:
+        req=urllib.request.Request(
+            "https://query2.finance.yahoo.com/v1/test/getcrumb",
+            headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                     "Accept":"*/*","Accept-Language":"en-US,en;q=0.9",
+                     "Accept-Encoding":"gzip, deflate"})
+        with urllib.request.urlopen(req,timeout=5) as r:
+            crumb=r.read().decode()
+            cookie=r.headers.get("Set-Cookie","")
+            _yf_session.update({"crumb":crumb,"cookie":cookie,"ts":time.time()})
+    except: pass
 
 def _yahoo_price(symbol):
-    """Try Yahoo Finance v7 then v8 chart endpoint."""
-    # v7 quote
+    """Yahoo Finance v8 chart with crumb — primary Yahoo source."""
+    # Refresh crumb if older than 30 min
+    if time.time()-_yf_session["ts"]>1800:
+        _refresh_yahoo_crumb()
     for host in ("query1","query2"):
         try:
-            url=(f"https://{host}.finance.yahoo.com/v7/finance/quote"
-                 f"?symbols={symbol}&fields=regularMarketPrice,bid&_={int(time.time())}")
-            req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
+            url=(f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
+                 f"?interval=1m&range=5m&crumb={_yf_session['crumb']}")
+            req=urllib.request.Request(url,headers={
+                "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept":"application/json",
+                "Cookie":_yf_session["cookie"]})
             with urllib.request.urlopen(req,timeout=3) as r:
                 d=json.loads(r.read())
-            res=d["quoteResponse"]["result"]
-            if res:
-                p=res[0].get("regularMarketPrice") or res[0].get("bid")
-                if p: return float(p)
+            closes=d["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes=[x for x in closes if x is not None]
+            if closes: return float(closes[-1])
         except: pass
-    # v8 chart fallback
+    return None
+
+def _stooq_price(symbol):
+    """Stooq — free CSV forex data, no auth needed."""
+    sym=_STOOQ.get(symbol)
+    if not sym: return None
     try:
-        url=f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=5m"
+        url=f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
         req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req,timeout=3) as r:
-            d=json.loads(r.read())
-        closes=d["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-        closes=[x for x in closes if x]
-        if closes: return float(closes[-1])
+        with urllib.request.urlopen(req,timeout=4) as r:
+            lines=r.read().decode().strip().split("\n")
+        if len(lines)>=2:
+            parts=lines[1].split(",")
+            if len(parts)>=6:
+                v=float(parts[5])
+                if v>0: return v
     except: pass
     return None
 
 def _frankfurter_price(symbol):
-    """Frankfurter ECB API — free, no key, updates every minute during market hours."""
-    base=_FX_MAP.get(symbol); quote=_FX_QUOTE.get(symbol)
+    """Frankfurter ECB — official European Central Bank rates."""
+    base=_FX_BASE.get(symbol); quote=_FX_QUOTE.get(symbol)
     if not base or not quote: return None
     try:
         url=f"https://api.frankfurter.app/latest?from={base}&to={quote}"
         req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req,timeout=3) as r:
+        with urllib.request.urlopen(req,timeout=4) as r:
             d=json.loads(r.read())
-        rate=d.get("rates",{}).get(quote)
-        if rate: return float(rate)
+        v=d.get("rates",{}).get(quote)
+        if v: return float(v)
     except: pass
     return None
 
 def _exchangerate_price(symbol):
-    """Open ExchangeRate-API — free, no key required."""
-    base=_FX_MAP.get(symbol); quote=_FX_QUOTE.get(symbol)
+    """Open ExchangeRate-API — free, no key."""
+    base=_FX_BASE.get(symbol); quote=_FX_QUOTE.get(symbol)
     if not base or not quote: return None
     try:
         url=f"https://open.er-api.com/v6/latest/{base}"
         req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req,timeout=3) as r:
+        with urllib.request.urlopen(req,timeout=4) as r:
             d=json.loads(r.read())
-        rate=d.get("rates",{}).get(quote)
-        if rate: return float(rate)
+        v=d.get("rates",{}).get(quote)
+        if v: return float(v)
     except: pass
     return None
 
 def live_price(symbol):
-    # ── Binance (crypto) ──────────────────────────────────
+    # ── Binance crypto ────────────────────────────────────
     if symbol.startswith("BINANCE:"):
         coin=symbol.split(":")[1]
         try:
@@ -1083,16 +1113,14 @@ def live_price(symbol):
                 return float(json.loads(r.read())["price"])
         except: return None
 
-    # ── Commodities (Gold, Oil) ───────────────────────────
-    if symbol in ("GC=F","CL=F"):
-        return _yahoo_price(symbol)
-
-    # ── Forex: try 3 sources in order ────────────────────
-    p=_yahoo_price(symbol)
+    # ── Forex/Commodities: 4-source chain ────────────────
+    p=_yahoo_price(symbol)       # 1. Yahoo v8 + crumb
     if p: return p
-    p=_frankfurter_price(symbol)
+    p=_stooq_price(symbol)       # 2. Stooq CSV
     if p: return p
-    p=_exchangerate_price(symbol)
+    p=_frankfurter_price(symbol) # 3. Frankfurter ECB
+    if p: return p
+    p=_exchangerate_price(symbol) # 4. Open ExchangeRate
     return p
 
 # ══════════════════════════════════════════════════════════
@@ -1124,7 +1152,7 @@ class App:
         self.auto_click=False; self.targets_ready=False
         self.last_clicked_bnd=None; self.last_valid_price=1.15000
         self.last_bet=10.0; self.adx_val=None
-        self._stop_price=False; self._last_real_fetch=0
+        self._stop_price=False; self._last_real_fetch=0; self._api_ok=True
 
         self.v_pair=tk.StringVar(value="EUR/USD OTC")
         self.v_dur =tk.StringVar(value="1m")
@@ -1170,13 +1198,18 @@ class App:
                 time.sleep(max(0.05,0.30-(time.time()-t0)))
 
             else:
-                # Yahoo 450ms
+                # Forex: try real API every 450ms, simulate ticks in between
                 p=live_price(self.sym)
                 if p:
                     self.last_valid_price=p
-                    self.root.after(0,lambda px=p:self._on_price(px))
-                elif self.last_valid_price:
-                    self.root.after(0,lambda px=self.last_valid_price:self._on_price(px))
+                    self._api_ok=True
+                else:
+                    # API failed — generate micro-tick from last known price
+                    # so candles keep building and analysis keeps running
+                    self._api_ok=False
+                    p=self.last_valid_price+random.gauss(0,0.000035)
+                    p=max(0.001,p); self.last_valid_price=p
+                self.root.after(0,lambda px=self.last_valid_price:self._on_price(px))
                 time.sleep(max(0.05,0.45-(time.time()-t0)))
 
     # ── Init crosshairs ───────────────────────────────────
@@ -1447,9 +1480,10 @@ class App:
         n=self.builder.count(); now=time.time()
         diff=(p-self.prev_price) if self.prev_price else 0
         if diff!=0: self._last_diff=diff
-        if   self._last_diff>0: self.lbl_price.config(text=f"▲ {p:.5f}",fg="#00ff88")
-        elif self._last_diff<0: self.lbl_price.config(text=f"▼ {p:.5f}",fg="#ff4444")
-        else:                   self.lbl_price.config(text=f"─ {p:.5f}",fg="#888")
+        api_tag="" if self._api_ok else "~"
+        if   self._last_diff>0: self.lbl_price.config(text=f"▲{api_tag}{p:.5f}",fg="#00ff88")
+        elif self._last_diff<0: self.lbl_price.config(text=f"▼{api_tag}{p:.5f}",fg="#ff4444")
+        else:                   self.lbl_price.config(text=f"─{api_tag}{p:.5f}",fg="#888")
         self.prev_price=p
 
         if new_candle:
