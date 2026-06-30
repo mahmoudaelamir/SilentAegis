@@ -490,6 +490,418 @@ class TelegramBot:
         self._post(f"{icon} *{result}* — {direction} on `{pair}`")
 
 # ══════════════════════════════════════════════════════════
+#  Order Book Analyzer — Binance depth API
+# ══════════════════════════════════════════════════════════
+class OrderBookAnalyzer:
+    def __init__(self):
+        self._data={}; self._last=0; self._interval=8
+
+    def _fetch(self,symbol):
+        sym=symbol.replace("BINANCE:","")
+        url=f"https://api.binance.com/api/v3/depth?symbol={sym}&limit=20"
+        try:
+            with urllib.request.urlopen(url,timeout=3) as r:
+                return json.loads(r.read())
+        except: return None
+
+    def update(self,symbol):
+        if not symbol.startswith("BINANCE:"): return
+        now=time.time()
+        if now-self._last<self._interval: return
+        self._last=now
+        data=self._fetch(symbol)
+        if not data: return
+        bids=data.get("bids",[]); asks=data.get("asks",[])
+        bid_vol=sum(float(b[1]) for b in bids[:10])
+        ask_vol=sum(float(a[1]) for a in asks[:10])
+        total=bid_vol+ask_vol
+        if total==0: return
+        ratio=bid_vol/total
+        # Find largest walls
+        best_bid=max(bids[:20],key=lambda x:float(x[1]),default=[0,0])
+        best_ask=max(asks[:20],key=lambda x:float(x[1]),default=[0,0])
+        self._data={
+            "bid_vol":bid_vol,"ask_vol":ask_vol,"ratio":ratio,
+            "wall_buy":float(best_bid[1]),"wall_sell":float(best_ask[1]),
+            "wall_buy_px":float(best_bid[0]),"wall_sell_px":float(best_ask[0]),
+        }
+
+    def signal(self):
+        d=self._data
+        if not d: return None,0,"OB:--"
+        r=d["ratio"]
+        if r>0.68: return "CALL",int(r*100),f"OB:{int(r*100)}%↑"
+        if r<0.32: return "PUT", int((1-r)*100),f"OB:{int((1-r)*100)}%↓"
+        return None,50,f"OB:{int(r*100)}%"
+
+    def summary(self):
+        d=self._data
+        if not d: return "OB:--"
+        r=d["ratio"]; clr_tag="↑" if r>0.5 else "↓"
+        return f"OB:{int(r*100)}%{clr_tag}"
+
+# ══════════════════════════════════════════════════════════
+#  Funding Rate Monitor — Binance futures
+# ══════════════════════════════════════════════════════════
+class FundingRateMonitor:
+    def __init__(self):
+        self._rate=None; self._last=0; self._interval=30
+
+    def update(self,symbol):
+        if not symbol.startswith("BINANCE:"): return
+        now=time.time()
+        if now-self._last<self._interval: return
+        self._last=now
+        sym=symbol.replace("BINANCE:","")
+        url=f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=1"
+        try:
+            with urllib.request.urlopen(url,timeout=3) as r:
+                data=json.loads(r.read())
+                if data: self._rate=float(data[0]["fundingRate"])
+        except: pass
+
+    def signal(self):
+        r=self._rate
+        if r is None: return None,0,"FR:--"
+        pct=r*100
+        if r<-0.08: return "PUT", 82,f"FR:{pct:.3f}% LongSqueeze"
+        if r>0.08:  return "CALL",82,f"FR:{pct:.3f}% ShortSqueeze"
+        if r<-0.03: return "PUT", 68,f"FR:{pct:.3f}% Bearish"
+        if r>0.03:  return "CALL",68,f"FR:{pct:.3f}% Bullish"
+        return None,50,f"FR:{pct:.3f}%"
+
+    def summary(self):
+        if self._rate is None: return "FR:--"
+        return f"FR:{self._rate*100:.3f}%"
+
+# ══════════════════════════════════════════════════════════
+#  Open Interest Monitor — Binance futures
+# ══════════════════════════════════════════════════════════
+class OpenInterestMonitor:
+    def __init__(self):
+        self._oi=None; self._prev_oi=None; self._last=0; self._interval=20
+
+    def update(self,symbol):
+        if not symbol.startswith("BINANCE:"): return
+        now=time.time()
+        if now-self._last<self._interval: return
+        self._last=now
+        sym=symbol.replace("BINANCE:","")
+        url=f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}"
+        try:
+            with urllib.request.urlopen(url,timeout=3) as r:
+                data=json.loads(r.read())
+                self._prev_oi=self._oi
+                self._oi=float(data["openInterest"])
+        except: pass
+
+    def signal(self,price_dir):
+        if self._oi is None or self._prev_oi is None: return None,0,"OI:--"
+        chg=(self._oi-self._prev_oi)/self._prev_oi*100 if self._prev_oi else 0
+        if abs(chg)<0.3: return None,50,f"OI:{chg:+.1f}%"
+        if chg>1.0 and price_dir=="CALL": return "CALL",78,f"OI+{chg:.1f}% TrendConf"
+        if chg>1.0 and price_dir=="PUT":  return "PUT", 78,f"OI+{chg:.1f}% TrendConf"
+        if chg<-1.0: return None,52,f"OI{chg:.1f}% Unwind"
+        return None,50,f"OI:{chg:+.1f}%"
+
+    def summary(self):
+        if self._oi is None: return "OI:--"
+        chg=0
+        if self._prev_oi: chg=(self._oi-self._prev_oi)/self._prev_oi*100
+        return f"OI:{chg:+.1f}%"
+
+# ══════════════════════════════════════════════════════════
+#  Volume & VWAP Analyzer — Binance klines
+# ══════════════════════════════════════════════════════════
+class VolumeAnalyzer:
+    def __init__(self):
+        self._klines=[]; self._last=0; self._interval=15
+
+    def update(self,symbol,interval="1m",limit=50):
+        if not symbol.startswith("BINANCE:"): return
+        now=time.time()
+        if now-self._last<self._interval: return
+        self._last=now
+        sym=symbol.replace("BINANCE:","")
+        url=f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}"
+        try:
+            with urllib.request.urlopen(url,timeout=3) as r:
+                self._klines=json.loads(r.read())
+        except: pass
+
+    def _vwap(self):
+        if len(self._klines)<5: return None
+        tpv=sum((float(k[2])+float(k[3])+float(k[4]))/3*float(k[5]) for k in self._klines)
+        vol=sum(float(k[5]) for k in self._klines)
+        return tpv/vol if vol else None
+
+    def _delta(self):
+        if not self._klines: return None
+        k=self._klines[-1]
+        o,h,l,c,v=float(k[1]),float(k[2]),float(k[3]),float(k[4]),float(k[5])
+        rng=h-l
+        if rng==0: return 0
+        buy_ratio=(c-l)/rng
+        return (buy_ratio*2-1)*v  # positive=buying, negative=selling
+
+    def _spike(self):
+        if len(self._klines)<10: return False,1.0
+        vols=[float(k[5]) for k in self._klines]
+        avg=sum(vols[:-1])/len(vols[:-1])
+        ratio=vols[-1]/avg if avg>0 else 1
+        return ratio>2.5, ratio
+
+    def signal(self,current_price):
+        vwap=self._vwap()
+        delta=self._delta()
+        is_spike,spike_ratio=self._spike()
+        signals=[]
+        # VWAP signal
+        if vwap and current_price:
+            gap=(current_price-vwap)/vwap*100
+            if gap>0.05:  signals.append(("CALL",74,f"VWAP+{gap:.2f}%"))
+            elif gap<-0.05: signals.append(("PUT",74,f"VWAP{gap:.2f}%"))
+        # Volume spike
+        if is_spike and delta is not None:
+            if delta>0: signals.append(("CALL",min(88,72+int(spike_ratio*3)),f"VolSpike↑{spike_ratio:.1f}x"))
+            else:       signals.append(("PUT", min(88,72+int(spike_ratio*3)),f"VolSpike↓{spike_ratio:.1f}x"))
+        # Delta
+        if delta is not None:
+            k=self._klines[-1] if self._klines else None
+            if k:
+                vol=float(k[5])
+                d_ratio=delta/vol if vol else 0
+                if d_ratio>0.4:  signals.append(("CALL",70,f"Delta+{d_ratio:.2f}"))
+                elif d_ratio<-0.4: signals.append(("PUT",70,f"Delta{d_ratio:.2f}"))
+        return signals
+
+    def vwap_str(self):
+        v=self._vwap(); return f"VWAP:{v:.2f}" if v else "VWAP:--"
+
+# ══════════════════════════════════════════════════════════
+#  Multi-Timeframe (Real 5m + 15m from Binance)
+# ══════════════════════════════════════════════════════════
+class MultiTimeframeReal:
+    def __init__(self):
+        self._tf={}; self._last={}; self._interval=20
+
+    def _fetch(self,symbol,tf,limit=50):
+        sym=symbol.replace("BINANCE:","")
+        url=f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={tf}&limit={limit}"
+        try:
+            with urllib.request.urlopen(url,timeout=3) as r:
+                return json.loads(r.read())
+        except: return None
+
+    def update(self,symbol):
+        if not symbol.startswith("BINANCE:"): return
+        now=time.time()
+        for tf in ("5m","15m","1h"):
+            if now-self._last.get(tf,0)<self._interval:
+                continue
+            klines=self._fetch(symbol,tf)
+            if klines:
+                self._tf[tf]=klines
+                self._last[tf]=now
+
+    def _trend(self,klines):
+        if not klines or len(klines)<26: return None
+        closes=[float(k[4]) for k in klines]
+        e8=_ema(closes,8); e21=_ema(closes,21)
+        if not e8 or not e21: return None
+        if e8>e21*1.001: return "CALL"
+        if e8<e21*0.999: return "PUT"
+        return None
+
+    def signal(self):
+        trends={tf:self._trend(self._tf.get(tf)) for tf in ("5m","15m","1h")}
+        valid=[v for v in trends.values() if v]
+        if not valid: return None,50,"MTF:--"
+        calls=valid.count("CALL"); puts=valid.count("PUT")
+        if calls==3: return "CALL",88,"MTF 5m+15m+1h CALL ✓✓✓"
+        if puts==3:  return "PUT", 88,"MTF 5m+15m+1h PUT ✓✓✓"
+        if calls==2: return "CALL",72,f"MTF 2/3 CALL"
+        if puts==2:  return "PUT", 72,f"MTF 2/3 PUT"
+        return None,50,"MTF:Mixed"
+
+    def summary(self):
+        trends={tf:self._trend(self._tf.get(tf)) for tf in ("5m","15m","1h")}
+        def sym(t): return ("↑" if t=="CALL" else "↓") if t else "─"
+        return f"5m{sym(trends.get('5m'))} 15m{sym(trends.get('15m'))} 1h{sym(trends.get('1h'))}"
+
+# ══════════════════════════════════════════════════════════
+#  Whale Tracker — large trades on Binance
+# ══════════════════════════════════════════════════════════
+class WhaleTracker:
+    def __init__(self):
+        self._trades=[]; self._last=0; self._interval=10
+        self._WHALE_USD=500_000  # $500K+
+
+    def update(self,symbol):
+        if not symbol.startswith("BINANCE:"): return
+        now=time.time()
+        if now-self._last<self._interval: return
+        self._last=now
+        sym=symbol.replace("BINANCE:","")
+        url=f"https://api.binance.com/api/v3/trades?symbol={sym}&limit=100"
+        try:
+            with urllib.request.urlopen(url,timeout=3) as r:
+                trades=json.loads(r.read())
+                self._trades=[t for t in trades
+                              if float(t["price"])*float(t["qty"])>self._WHALE_USD]
+        except: pass
+
+    def signal(self):
+        if not self._trades: return None,0,"Whale:--"
+        buys=sum(1 for t in self._trades if not t.get("isBuyerMaker",True))
+        sells=len(self._trades)-buys
+        total=len(self._trades)
+        if total==0: return None,0,"Whale:--"
+        if buys>=sells*2: return "CALL",80,f"Whale↑ {buys}B/{sells}S"
+        if sells>=buys*2: return "PUT", 80,f"Whale↓ {sells}S/{buys}B"
+        return None,55,f"Whale:{buys}B/{sells}S"
+
+    def summary(self):
+        if not self._trades: return "Whale:--"
+        buys=sum(1 for t in self._trades if not t.get("isBuyerMaker",True))
+        sells=len(self._trades)-buys
+        return f"🐋{buys}B/{sells}S"
+
+# ══════════════════════════════════════════════════════════
+#  Fear & Greed Index — alternative.me
+# ══════════════════════════════════════════════════════════
+class FearGreedIndex:
+    def __init__(self):
+        self._val=None; self._cls=None; self._last=0; self._interval=300
+
+    def update(self):
+        now=time.time()
+        if now-self._last<self._interval: return
+        self._last=now
+        try:
+            with urllib.request.urlopen("https://api.alternative.me/fng/?limit=1",timeout=4) as r:
+                data=json.loads(r.read())["data"][0]
+                self._val=int(data["value"])
+                self._cls=data["value_classification"]
+        except: pass
+
+    def signal(self):
+        v=self._val
+        if v is None: return None,0,"F&G:--"
+        if v<=15:  return "CALL",82,f"F&G:ExtremeFear({v})"
+        if v<=25:  return "CALL",72,f"F&G:Fear({v})"
+        if v>=85:  return "PUT", 82,f"F&G:ExtremeGreed({v})"
+        if v>=75:  return "PUT", 70,f"F&G:Greed({v})"
+        return None,55,f"F&G:{v}({self._cls})"
+
+    def summary(self):
+        if self._val is None: return "F&G:--"
+        icon="😱" if self._val<25 else ("🤑" if self._val>75 else "😐")
+        return f"{icon}F&G:{self._val}"
+
+# ══════════════════════════════════════════════════════════
+#  BTC/DXY Correlation Filter
+# ══════════════════════════════════════════════════════════
+class DXYCorrelation:
+    def __init__(self):
+        self._dxy=None; self._prev_dxy=None; self._last=0; self._interval=60
+
+    def update(self):
+        now=time.time()
+        if now-self._last<self._interval: return
+        self._last=now
+        # DXY from Yahoo Finance stooq
+        try:
+            url="https://stooq.com/q/l/?s=dx.f&f=sd2t2ohlcv&h&e=csv"
+            with urllib.request.urlopen(url,timeout=4) as r:
+                lines=r.read().decode().strip().split("\n")
+                if len(lines)>=2:
+                    row=lines[1].split(",")
+                    self._prev_dxy=self._dxy
+                    self._dxy=float(row[4])  # close
+        except: pass
+
+    def signal(self,btc_dir):
+        if self._dxy is None or self._prev_dxy is None: return None,0,"DXY:--"
+        chg=(self._dxy-self._prev_dxy)/self._prev_dxy*100
+        if abs(chg)<0.05: return None,50,f"DXY:{self._dxy:.2f}"
+        # DXY up → BTC down (inverse correlation)
+        if chg>0.15 and btc_dir=="CALL":
+            return "PUT",70,f"DXY↑{chg:.2f}% BTC↓"
+        if chg<-0.15 and btc_dir=="PUT":
+            return "CALL",70,f"DXY↓{chg:.2f}% BTC↑"
+        return None,55,f"DXY:{chg:+.2f}%"
+
+    def summary(self):
+        if self._dxy is None: return "DXY:--"
+        return f"DXY:{self._dxy:.2f}"
+
+# ══════════════════════════════════════════════════════════
+#  Self-Learning Weight Adjuster
+# ══════════════════════════════════════════════════════════
+class SelfLearner:
+    def __init__(self,engine):
+        self._engine=engine
+        self._strat_results={}  # {strat: [True/False, ...]}
+        self._last_adjust=0; self._adjust_interval=300  # every 5min
+
+    def record(self,strat,won):
+        if strat not in self._strat_results:
+            self._strat_results[strat]=[]
+        self._strat_results[strat].append(won)
+        # Keep last 50 results per strategy
+        self._strat_results[strat]=self._strat_results[strat][-50:]
+        self._maybe_adjust()
+
+    def _maybe_adjust(self):
+        now=time.time()
+        if now-self._last_adjust<self._adjust_interval: return
+        self._last_adjust=now
+        for strat,results in self._strat_results.items():
+            if len(results)<10: continue
+            wr=sum(results)/len(results)
+            # Adjust weight: high WR gets boost, low WR gets penalty
+            mult=1.0+(wr-0.55)*0.6  # WR=70% → 1.09, WR=40% → 0.91
+            mult=max(0.6,min(1.4,mult))
+            for W in (self._engine.W, self._engine.W_CRYPTO):
+                if strat in W:
+                    W[strat]=round(W[strat]*mult,3)
+
+    def summary(self):
+        if not self._strat_results: return "Learn:0"
+        total=sum(len(v) for v in self._strat_results.values())
+        return f"Learn:{total}trades"
+
+# ══════════════════════════════════════════════════════════
+#  Adaptive Expiry Suggester
+# ══════════════════════════════════════════════════════════
+class AdaptiveExpiry:
+    def suggest(self,candles,current_dur):
+        if len(candles)<15: return current_dur,""
+        atr=_atr(candles,14)
+        if not atr: return current_dur,""
+        closes=[c["c"] for c in candles]
+        price=closes[-1]; atr_pct=atr/price*100
+        # Low volatility → shorter expiry; High volatility → longer expiry
+        if atr_pct<0.08: sug=30; note="ATR low→30s"
+        elif atr_pct<0.18: sug=60; note="ATR med→1m"
+        elif atr_pct<0.35: sug=120; note="ATR hi→2m"
+        else: sug=180; note="ATR v.hi→3m"
+        return sug,note
+
+# ══════════════════════════════════════════════════════════
+#  Smart Entry Timer — best moment within candle
+# ══════════════════════════════════════════════════════════
+class SmartEntryTimer:
+    """Enter in first 10s or last 5s of candle — avoid noisy middle."""
+    def is_good_entry(self,builder):
+        elapsed=builder._elapsed() if hasattr(builder,"_elapsed") else 0
+        dur=builder.dur
+        if dur==0: return True
+        pos=elapsed/dur
+        return pos<0.18 or pos>0.88  # first 18% or last 12% of candle
+
+# ══════════════════════════════════════════════════════════
 #  Regime Detector — identifies market type for strategy selection
 # ══════════════════════════════════════════════════════════
 class RegimeDetector:
@@ -1177,6 +1589,7 @@ class CandleBuilder:
         return r
 
     def remaining(self): return self.dur-(time.time()%self.dur)
+    def _elapsed(self): return time.time()%self.dur
     def count(self): return len(self.done)
 
 # ══════════════════════════════════════════════════════════
@@ -1351,8 +1764,21 @@ class App:
         self.backtester=Backtester(self.engine)
         self.scanner=MultiPairScanner(self.engine)
         self.pattern_validator=PatternValidator()
-        self._pending_signal=None   # (dir, conf, reason, strat, cf) waiting for confirmation
-        self._pending_candle=0      # candle index when pending signal was set
+        self._pending_signal=None
+        self._pending_candle=0
+        # ── New professional modules ────────────────────────
+        self.ob=OrderBookAnalyzer()
+        self.fr=FundingRateMonitor()
+        self.oi=OpenInterestMonitor()
+        self.vol=VolumeAnalyzer()
+        self.mtf_real=MultiTimeframeReal()
+        self.whale=WhaleTracker()
+        self.fg=FearGreedIndex()
+        self.dxy=DXYCorrelation()
+        self.self_learner=SelfLearner(self.engine)
+        self.adaptive_expiry=AdaptiveExpiry()
+        self.smart_timer=SmartEntryTimer()
+        threading.Thread(target=self._pro_data_loop,daemon=True).start()
 
         self.direction=None; self.conf=0; self.reason=""; self.strat_name=""
         self.confluence=0; self.prev_price=None; self._last_diff=0
@@ -1375,6 +1801,24 @@ class App:
         self._price_loop()
 
     # ── Price loop (V18 ultra-fast) ───────────────────────
+    def _pro_data_loop(self):
+        """Background thread: fetches all professional data sources every few seconds."""
+        self.fg.update()  # Fear & Greed first (slow)
+        self.dxy.update()
+        while True:
+            sym=self.sym
+            try:
+                self.ob.update(sym)
+                self.fr.update(sym)
+                self.oi.update(sym)
+                self.vol.update(sym)
+                self.mtf_real.update(sym)
+                self.whale.update(sym)
+                self.fg.update()
+                self.dxy.update()
+            except Exception: pass
+            time.sleep(5)
+
     def _price_loop(self):
         self._stop_price=False
         threading.Thread(target=self._price_worker,daemon=True).start()
@@ -1495,7 +1939,7 @@ class App:
                   relief="flat",command=self._run_backtest).pack(side="left",padx=2)
         self.v_pair.trace("w",lambda *_:self._on_change())
         self.v_dur.trace("w", lambda *_:self._on_change())
-        tk.Label(c2,text="● 22 Signals | Divergence | News | Scanner | ML",
+        tk.Label(c2,text="● 22 Signals | OB | FR | OI | VWAP | Whale | F&G | MTF | DXY | Self-Learn",
                  bg="#050810",fg="#A78BFA",font=("Consolas",6,"bold")).pack(anchor="w",padx=3)
 
         # Col 3 — Price
@@ -1731,6 +2175,43 @@ class App:
         self.lbl_next_news.config(text=next_ev)
 
         d,c,r,s,cf=self.engine.run_all(cs,crypto=is_crypto)
+        cur_price=self.last_valid_price
+
+        # ── Professional signals integration ────────────────────────────────
+        pro_signals=[]
+        if is_crypto:
+            ob_dir,ob_conf,ob_txt=self.ob.signal()
+            if ob_dir: pro_signals.append((ob_dir,ob_conf,ob_txt))
+            fr_dir,fr_conf,fr_txt=self.fr.signal()
+            if fr_dir: pro_signals.append((fr_dir,fr_conf,fr_txt))
+            oi_dir,oi_conf,oi_txt=self.oi.signal(d)
+            if oi_dir: pro_signals.append((oi_dir,oi_conf,oi_txt))
+            for vs in self.vol.signal(cur_price): pro_signals.append(vs)
+            mtf_dir,mtf_conf,mtf_txt=self.mtf_real.signal()
+            if mtf_dir: pro_signals.append((mtf_dir,mtf_conf,mtf_txt))
+            wh_dir,wh_conf,wh_txt=self.whale.signal()
+            if wh_dir: pro_signals.append((wh_dir,wh_conf,wh_txt))
+            fg_dir,fg_conf,fg_txt=self.fg.signal()
+            if fg_dir: pro_signals.append((fg_dir,fg_conf,fg_txt))
+            dxy_dir,dxy_conf,dxy_txt=self.dxy.signal(d)
+            if dxy_dir: pro_signals.append((dxy_dir,dxy_conf,dxy_txt))
+            # DXY override: if DXY strongly contradicts, flip signal
+            if dxy_dir and dxy_dir!=d and dxy_conf>=70:
+                d=dxy_dir; c=max(52,c-10); r=f"DXY↔{r}"
+        # Count pro signals agreeing with main signal
+        pro_agree=sum(1 for pd,pc,pt in pro_signals if pd==d and pc>=65)
+        pro_oppose=sum(1 for pd,pc,pt in pro_signals if pd!=d and pc>=65)
+        # Boost if pro signals confirm
+        if pro_agree>=3: c=min(85 if is_crypto else 93, c+8); cf+=pro_agree
+        elif pro_agree>=2: c=min(85 if is_crypto else 93, c+4); cf+=pro_agree
+        # Penalize if pro signals contradict
+        if pro_oppose>=3: c=max(52,c-15)
+        elif pro_oppose>=2: c=max(52,c-8)
+        # Adaptive expiry suggestion
+        sug_exp,exp_note=self.adaptive_expiry.suggest(cs,self.builder.dur)
+        # Pro summary for UI
+        pro_sum=" | ".join(pt for pd,pc,pt in pro_signals[:3]) if pro_signals else ""
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── Market Structure Gate ────────────────────────────────────────────
         # Check if price is making HH/HL (uptrend) or LH/LL (downtrend)
@@ -1831,16 +2312,22 @@ class App:
         confl_clr="#00ff88" if cf>=cf_gate+2 else ("#ffaa00" if cf>=cf_gate else "#666")
         self.lbl_confl.config(text=f"CF:{cf} signals{'⚡' if is_crypto else ''}{consec_tag}",fg=confl_clr)
 
-        # Scanner row
-        scan_txt=self.scanner.summary()
-        best=self.scanner.best()
-        if best:
-            bn,bd,bc,bcf=best
-            scan_clr="#00ff88" if bd=="CALL" else "#ff4444"
-            self.lbl_scan.config(text=f"BEST:{bn} {'▲' if bd=='CALL' else '▼'}{bc}%  |  {scan_txt}",
-                                 fg=scan_clr)
+        # Scanner / Pro data row
+        if is_crypto:
+            pro_line=f"{self.ob.summary()} | {self.fr.summary()} | {self.whale.summary()} | {self.fg.summary()} | {self.mtf_real.summary()} | {self.vol.vwap_str()} | {self.dxy.summary()}"
+            if exp_note: pro_line+=f" | 🕐{exp_note}"
+            pro_clr="#00ff88" if pro_agree>=3 else ("#ffaa00" if pro_agree>=1 else "#445566")
+            self.lbl_scan.config(text=pro_line,fg=pro_clr)
         else:
-            self.lbl_scan.config(text=scan_txt,fg="#445566")
+            scan_txt=self.scanner.summary()
+            best=self.scanner.best()
+            if best:
+                bn,bd,bc,bcf=best
+                scan_clr="#00ff88" if bd=="CALL" else "#ff4444"
+                self.lbl_scan.config(text=f"BEST:{bn} {'▲' if bd=='CALL' else '▼'}{bc}%  |  {scan_txt}",
+                                     fg=scan_clr)
+            else:
+                self.lbl_scan.config(text=scan_txt,fg="#445566")
 
         changed=(d!=self.direction)
         self.direction=d; self.conf=c; self.reason=r
@@ -1928,6 +2415,7 @@ class App:
         self.brain.record(self.strat_name,result,self.direction,
                           self.last_valid_price,self.last_valid_price,
                           datetime.datetime.now().strftime("%H:%M:%S"))
+        self.self_learner.record(self.strat_name, result=="WIN")
         self.tg.send_result(result,self.direction,self.v_pair.get())
         self._beep(result)
         try:
