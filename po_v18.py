@@ -1742,18 +1742,15 @@ def live_price(symbol):
     return p
 
 # ══════════════════════════════════════════════════════════
-#  Pocket Option API Integration
-#  pip install git+https://github.com/A11ksa/API-Pocket-Option.git
+#  Pocket Option WebSocket Integration (websocket-client)
+#  pip install websocket-client
 # ══════════════════════════════════════════════════════════
 try:
-    import asyncio
-    from api_pocket import AsyncPocketOptionClient, get_ssid
-    from api_pocket.models import OrderDirection
-    PO_API_AVAILABLE=True
+    import websocket; WS_AVAILABLE=True
 except ImportError:
-    PO_API_AVAILABLE=False
+    WS_AVAILABLE=False
 
-# Map our pair names → Pocket Option asset names
+# Map our pair names → Pocket Option asset IDs
 PO_ASSET_MAP={
     "EURUSD=X":"EURUSD_otc","GBPUSD=X":"GBPUSD_otc","USDJPY=X":"USDJPY_otc",
     "AUDUSD=X":"AUDUSD_otc","GBPJPY=X":"GBPJPY_otc","EURJPY=X":"EURJPY_otc",
@@ -1764,104 +1761,146 @@ PO_ASSET_MAP={
 
 class PocketOptionTrader:
     """
-    Wraps the AsyncPocketOptionClient to allow placing orders and
-    checking results from synchronous tkinter code via a background
-    asyncio event loop.
+    Direct WebSocket connection to Pocket Option using websocket-client.
+    No external API library needed — only websocket-client (pip install websocket-client).
     """
+    WS_DEMO ="wss://demo-api-v2.po.market/socket.io/?EIO=4&transport=websocket"
+    WS_LIVE ="wss://api-v2.po.market/socket.io/?EIO=4&transport=websocket"
+
     def __init__(self):
         self.enabled=False
         self.is_demo=True
         self.ssid=None
-        self.client=None
-        self._loop=None
+        self._ws=None
         self._thread=None
         self.status="Not connected"
-        self.last_order_id=None
-        self.last_result=None
-        self._on_result_cb=None  # called with ("WIN"/"LOSS") when trade closes
+        self.balance=None
+        self._pending_orders={}   # {request_id: on_result_cb}
+        self._req_id=1
+        self._connected=False
 
     def configure(self,ssid,is_demo=True):
         self.ssid=ssid; self.is_demo=is_demo
 
     def connect(self):
-        if not PO_API_AVAILABLE:
-            self.status="❌ api_pocket not installed"; return False
+        if not WS_AVAILABLE:
+            self.status="❌ Run: pip install websocket-client"; return False
         if not self.ssid:
-            self.status="❌ No SSID"; return False
-        self._loop=asyncio.new_event_loop()
-        self._thread=threading.Thread(target=self._run_loop,daemon=True)
+            self.status="❌ No SSID entered"; return False
+        self._thread=threading.Thread(target=self._ws_loop,daemon=True)
         self._thread.start()
-        # Give the loop a moment to connect
-        time.sleep(2)
-        return True
+        # Wait up to 6s for connection
+        for _ in range(12):
+            if self._connected: return True
+            time.sleep(0.5)
+        return self._connected
 
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._async_connect())
+    def _ws_loop(self):
+        url=self.WS_DEMO if self.is_demo else self.WS_LIVE
+        self._ws=websocket.WebSocketApp(
+            url,
+            on_open   =self._on_open,
+            on_message=self._on_message,
+            on_error  =self._on_error,
+            on_close  =self._on_close,
+            header={"Cookie": f"ci_session={self.ssid}"}
+        )
+        self._ws.run_forever(ping_interval=20,ping_timeout=10)
 
-    async def _async_connect(self):
+    def _on_open(self,ws):
+        # Socket.IO handshake — send auth after receiving "0" (open packet)
+        pass
+
+    def _on_message(self,ws,msg):
         try:
-            self.client=AsyncPocketOptionClient(ssid=self.ssid,is_demo=self.is_demo)
-            await self.client.connect()
-            self.enabled=True
-            self.status=f"✅ Connected ({'Demo' if self.is_demo else 'Live'})"
-            # Keep loop alive
-            while self.enabled:
-                await asyncio.sleep(1)
+            # Socket.IO protocol: messages start with a number prefix
+            if msg.startswith("0"):
+                # Connected — authenticate with SSID
+                auth=json.dumps({"ssid":self.ssid,"is_demo":1 if self.is_demo else 0})
+                ws.send(f'40{auth}')
+            elif msg.startswith("40"):
+                # Auth confirmed
+                self._connected=True; self.enabled=True
+                self.status=f"✅ Connected ({'Demo' if self.is_demo else 'Live'})"
+                # Request balance
+                ws.send('42["sendMessage",{"action":"changeSymbol","message":{"asset":"EURUSD_otc","period":60}}]')
+            elif msg.startswith("42"):
+                data=json.loads(msg[2:])
+                self._handle_event(data)
+            elif msg=="2":
+                ws.send("3")  # pong
         except Exception as e:
-            self.status=f"❌ {e}"; self.enabled=False
+            pass
+
+    def _handle_event(self,data):
+        if not isinstance(data,list) or len(data)<2: return
+        event=data[0]; payload=data[1] if len(data)>1 else {}
+        if event=="successauth":
+            self._connected=True; self.enabled=True
+            self.status=f"✅ Auth OK ({'Demo' if self.is_demo else 'Live'})"
+        elif event=="updateBalance":
+            try: self.balance=float(payload.get("amount",0))
+            except: pass
+        elif event=="successopenOrder":
+            order_id=payload.get("id")
+            self.status=f"📤 Order #{order_id}"
+        elif event=="closedOrder" or event=="successcloseOrder":
+            order_id=payload.get("id")
+            profit=float(payload.get("profit",0))
+            outcome="WIN" if profit>0 else "LOSS"
+            self.status=f"{'✅' if outcome=='WIN' else '❌'} {outcome} ${abs(profit):.2f}"
+            cb=self._pending_orders.pop(order_id,None)
+            if cb: cb(outcome)
+
+    def _on_error(self,ws,err):
+        self.status=f"⚠ {str(err)[:50]}"
+        self._connected=False; self.enabled=False
+
+    def _on_close(self,ws,code,msg):
+        self._connected=False; self.enabled=False
+        self.status="Disconnected"
 
     def place_order(self,asset_sym,amount,direction,duration,on_result=None):
-        """
-        Non-blocking: submits order in background, calls on_result("WIN"/"LOSS")
-        when the trade closes.
-        """
-        if not self.enabled or not self.client:
+        if not self.enabled or not self._ws:
             return False
-        po_asset=PO_ASSET_MAP.get(asset_sym)
-        if not po_asset:
-            self.status=f"⚠ No PO asset for {asset_sym}"; return False
-        dir_enum=OrderDirection.CALL if direction=="CALL" else OrderDirection.PUT
-        self._on_result_cb=on_result
-        future=asyncio.run_coroutine_threadsafe(
-            self._async_place(po_asset,amount,dir_enum,duration), self._loop)
-        future.add_done_callback(self._order_placed)
-        return True
-
-    async def _async_place(self,asset,amount,direction,duration):
-        order=await self.client.place_order(
-            asset=asset, amount=amount, direction=direction, duration=duration)
-        self.last_order_id=order.order_id
-        self.status=f"📤 Order #{order.order_id}"
-        # Wait for result
-        result=await self.client.check_win(order.order_id)
-        return result
-
-    def _order_placed(self,future):
+        po_asset=PO_ASSET_MAP.get(asset_sym,"EURUSD_otc")
+        action=1 if direction=="CALL" else 0
+        req_id=self._req_id; self._req_id+=1
+        msg=json.dumps(["sendMessage",{
+            "action":"openOrder",
+            "message":{
+                "asset":po_asset,
+                "amount":round(float(amount),2),
+                "action":action,
+                "isDemo":1 if self.is_demo else 0,
+                "requestId":req_id,
+                "optionType":100,   # binary
+                "time":duration
+            }
+        }])
         try:
-            result=future.result()
-            # result is truthy for WIN, falsy for LOSS (depends on API)
-            outcome="WIN" if result else "LOSS"
-            self.last_result=outcome
-            self.status=f"{'✅' if outcome=='WIN' else '❌'} {outcome}"
-            if self._on_result_cb:
-                self._on_result_cb(outcome)
+            self._ws.send(f"42{msg}")
+            if on_result: self._pending_orders[req_id]=on_result
+            self.status=f"📤 {direction} ${amount} {po_asset}"
+            return True
         except Exception as e:
-            self.status=f"⚠ {e}"
-
-    def disconnect(self):
-        self.enabled=False
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            self.status=f"⚠ {e}"; return False
 
     def get_balance_sync(self):
-        if not self.enabled or not self.client: return None
-        future=asyncio.run_coroutine_threadsafe(
-            self.client.get_balance(), self._loop)
+        if not self.enabled: return None
+        # Request balance update
         try:
-            bal=future.result(timeout=4)
-            return bal.balance
-        except: return None
+            self._ws.send('42["sendMessage",{"action":"getBalance","message":{}}]')
+            time.sleep(1)
+        except: pass
+        return self.balance
+
+    def disconnect(self):
+        self.enabled=False; self._connected=False
+        if self._ws:
+            try: self._ws.close()
+            except: pass
+        self.status="Disconnected"
 
 # ══════════════════════════════════════════════════════════
 #  Main Application
@@ -2198,44 +2237,28 @@ class App:
         def _connect():
             ssid=v_ssid.get().strip()
             if not ssid:
-                if not PO_API_AVAILABLE:
-                    lbl_st.config(text="❌ Install: pip install git+https://github.com/A11ksa/API-Pocket-Option.git",fg="#ff4444")
-                    return
-                lbl_st.config(text="🔄 Logging in via Selenium...",fg="#ffaa00")
-                win.update()
-                def _do_login():
-                    try:
-                        result=get_ssid(email=v_email.get(),password=v_pass.get())
-                        ssid_val=result["demo"] if v_demo.get() else result["live"]
-                        self.po_trader.configure(ssid_val,is_demo=v_demo.get())
-                        ok=self.po_trader.connect()
+                lbl_st.config(text="❌ لازم تحط الـ SSID",fg="#ff4444")
+                return
+            if not WS_AVAILABLE:
+                lbl_st.config(text="❌ Run: pip install websocket-client",fg="#ff4444")
+                return
+            self.po_trader.configure(ssid,is_demo=v_demo.get())
+            lbl_st.config(text="🔄 Connecting...",fg="#ffaa00"); win.update()
+            def _do_connect():
+                ok=self.po_trader.connect()
+                win.after(0,lambda:lbl_st.config(
+                    text=self.po_trader.status,
+                    fg="#00ff88" if ok else "#ff4444"))
+                win.after(0,lambda:self.lbl_po.config(
+                    text=f"PO:{self.po_trader.status}",
+                    fg="#00ff88" if ok else "#ff4444"))
+                if ok:
+                    bal=self.po_trader.get_balance_sync()
+                    if bal:
                         win.after(0,lambda:lbl_st.config(
-                            text=self.po_trader.status,
-                            fg="#00ff88" if ok else "#ff4444"))
-                        win.after(0,lambda:self.lbl_po.config(
-                            text=f"PO:{self.po_trader.status}",
-                            fg="#00ff88" if ok else "#ff4444"))
-                    except Exception as e:
-                        win.after(0,lambda:lbl_st.config(text=f"❌ {e}",fg="#ff4444"))
-                threading.Thread(target=_do_login,daemon=True).start()
-            else:
-                self.po_trader.configure(ssid,is_demo=v_demo.get())
-                lbl_st.config(text="🔄 Connecting...",fg="#ffaa00"); win.update()
-                def _do_connect():
-                    ok=self.po_trader.connect()
-                    win.after(0,lambda:lbl_st.config(
-                        text=self.po_trader.status,
-                        fg="#00ff88" if ok else "#ff4444"))
-                    win.after(0,lambda:self.lbl_po.config(
-                        text=f"PO:{self.po_trader.status}",
-                        fg="#00ff88" if ok else "#ff4444"))
-                    if ok:
-                        bal=self.po_trader.get_balance_sync()
-                        if bal:
-                            win.after(0,lambda:lbl_st.config(
-                                text=f"{self.po_trader.status} | Balance: ${bal:.2f}",
-                                fg="#00ff88"))
-                threading.Thread(target=_do_connect,daemon=True).start()
+                            text=f"{self.po_trader.status} | Balance: ${bal:.2f}",
+                            fg="#00ff88"))
+            threading.Thread(target=_do_connect,daemon=True).start()
 
         def _disconnect():
             self.po_trader.disconnect()
@@ -2254,8 +2277,8 @@ class App:
                   relief="flat",command=_check_bal,padx=8,pady=4).pack(side="left",padx=4)
         tk.Button(br,text="Disconnect",bg="#1a0a0a",fg="#ff4444",font=("Consolas",9),
                   relief="flat",command=_disconnect,padx=8,pady=4).pack(side="left",padx=4)
-        tk.Label(win,text="⚠ pip install git+https://github.com/A11ksa/API-Pocket-Option.git",
-                 bg="#050810",fg="#333",font=("Consolas",6)).pack(pady=2)
+        tk.Label(win,text="⚠ SSID = ci_session cookie من المتصفح (F12 → Application → Cookies)",
+                 bg="#050810",fg="#445",font=("Consolas",6)).pack(pady=2)
 
     def _tg_settings(self):
         win=tk.Toplevel(self.root)
