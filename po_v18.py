@@ -490,9 +490,99 @@ class TelegramBot:
         self._post(f"{icon} *{result}* — {direction} on `{pair}`")
 
 # ══════════════════════════════════════════════════════════
+#  Regime Detector — identifies market type for strategy selection
+# ══════════════════════════════════════════════════════════
+class RegimeDetector:
+    TREND=1; RANGE=0; VOLATILE=2
+
+    def detect(self,candles):
+        if len(candles)<22: return self.RANGE
+        closes=[c["c"] for c in candles]
+        adx=_adx(candles,14)
+        up,mid,lo=_bollinger(closes,20)
+        bw=(up-lo)/mid if mid and mid!=0 else 0
+        e8=_ema(closes,8); e21=_ema(closes,21)
+        emas_aligned=e8 and e21 and abs(e8-e21)/e21>0.0008
+        if bw>0.045: return self.VOLATILE
+        if adx and adx>25 and emas_aligned: return self.TREND
+        return self.RANGE
+
+    # Per-regime weight multipliers
+    TREND_MULT={
+        "smc":1.3,"candle":1.2,"div":1.4,"sr":0.9,"mtf":1.5,
+        "ichi":1.3,"ema":1.5,"fib":1.1,"bb":0.5,"macd":1.5,
+        "rsi":0.5,"mom":1.5,"ha":1.2,"sto":0.3,"atr":1.3,
+        "cci":0.5,"psar":1.3,"super":1.5,"will":0.3,
+    }
+    RANGE_MULT={
+        "smc":1.0,"candle":1.2,"div":1.1,"sr":1.5,"mtf":0.6,
+        "ichi":0.8,"ema":0.7,"fib":1.3,"bb":1.5,"macd":0.7,
+        "rsi":1.5,"mom":0.6,"ha":1.0,"sto":1.5,"atr":0.8,
+        "cci":1.5,"psar":0.8,"super":0.6,"will":1.5,
+    }
+    VOLATILE_MULT={k:0.65 for k in ["smc","candle","div","sr","mtf","ichi","ema","fib",
+                                     "bb","macd","rsi","mom","ha","sto","atr","cci",
+                                     "psar","super","will"]}
+
+    def get_mult(self,regime):
+        if regime==self.TREND:    return self.TREND_MULT
+        if regime==self.VOLATILE: return self.VOLATILE_MULT
+        return self.RANGE_MULT
+
+# ══════════════════════════════════════════════════════════
+#  Pattern Validator — checks if this setup worked historically
+# ══════════════════════════════════════════════════════════
+class PatternValidator:
+    """
+    Looks at the last N candles and checks: when the bot gave a
+    strong signal in the past, how often was it correct?
+    Returns a confidence multiplier based on recent accuracy.
+    """
+    def __init__(self):
+        self._cache={}; self._last_ts=0
+
+    def validate(self,engine,candles,cur_dir,crypto=False):
+        """
+        Replay the last 30 closed candles, see what signal the engine
+        would have given, and check if the next candle confirmed it.
+        Returns (accuracy 0-1, sample_count).
+        """
+        now=time.time()
+        cache_key=f"{cur_dir}_{len(candles)}_{crypto}"
+        # Cache for 60s to avoid heavy recompute every tick
+        if now-self._last_ts<60 and cache_key in self._cache:
+            return self._cache[cache_key]
+
+        lookback=min(35,len(candles)-10)
+        if lookback<8:
+            return 0.5,0
+
+        wins=0; total=0
+        # Replay signals on past windows
+        for i in range(len(candles)-lookback, len(candles)-1):
+            window=candles[max(0,i-40):i+1]
+            if len(window)<8: continue
+            try:
+                d,c,r,s,cf=engine.run_all(window,crypto=crypto)
+            except Exception:
+                continue
+            if c<62 or cf<2: continue  # only count confident signals
+            next_c=candles[i+1]["c"]; curr_c=candles[i]["c"]
+            actual="CALL" if next_c>curr_c else "PUT"
+            if d==actual: wins+=1
+            total+=1
+
+        acc=wins/total if total>=3 else 0.50
+        self._cache[cache_key]=(acc,total)
+        self._last_ts=now
+        return acc,total
+
+# ══════════════════════════════════════════════════════════
 #  Strategy Engine — 22 signal sources
 # ══════════════════════════════════════════════════════════
 class StrategyEngine:
+    _regime_det=RegimeDetector()
+
     # Forex weights
     W={
         "smc":2.5,"candle":2.2,"div":2.0,"sr":2.0,"mtf":2.1,
@@ -515,12 +605,22 @@ class StrategyEngine:
         lows  =[c["l"] for c in candles]
         c1,c2,c3,c4=candles[-4],candles[-3],candles[-2],candles[-1]
 
+        # Detect market regime — determines which strategies to amplify
+        regime=self._regime_det.detect(candles)
+        regime_mult=self._regime_det.get_mult(regime)
+        regime_names={RegimeDetector.TREND:"📈Trend",
+                      RegimeDetector.RANGE:"📊Range",
+                      RegimeDetector.VOLATILE:"⚡Volatile"}
+        self.last_regime=regime_names.get(regime,"?")
+
         # Crypto يحتاج ADX أقوى (25+) بدل 18
         adx_val=_adx(candles,14)
         adx_thresh=25 if crypto else 18
         adx_ok=adx_val is None or adx_val>=adx_thresh
 
-        W=self.W_CRYPTO if crypto else self.W
+        base_W=self.W_CRYPTO if crypto else self.W
+        # Apply regime multiplier on top of base weights
+        W={k:base_W[k]*regime_mult.get(k,1.0) for k in base_W}
         results=[]
 
         def add(sig,group):
@@ -563,30 +663,40 @@ class StrategyEngine:
             micro="CALL" if closes[-1]>=closes[-2] else "PUT"
             return micro,52,"Live Pulse","Micro",0
 
+        # ── Volatile market: no trade unless very strong setup ───────────────
+        if regime==RegimeDetector.VOLATILE:
+            high_conf=[r for r in results if r[1]>=85]
+            if len(high_conf)<3:
+                return ("CALL" if closes[-1]>closes[-2] else "PUT"),52,
+                f"⚡ Volatile — Wait","Wait",0
+
         # ── Trend Alignment Filter ──────────────────────────────────────────
-        # Determine dominant short-term trend from EMAs
+        # Determine dominant short-term trend from EMAs + EMA50
         trend_dir=None
         if len(closes)>=22:
             e8=_ema(closes,8); e21=_ema(closes,21)
             if e8 and e21:
-                if e8>e21*1.0005: trend_dir="CALL"   # clear uptrend
-                elif e8<e21*0.9995: trend_dir="PUT"  # clear downtrend
-        # For crypto also check EMA50 for stronger confirmation
-        if crypto and len(closes)>=51:
+                if e8>e21*1.0005:   trend_dir="CALL"
+                elif e8<e21*0.9995: trend_dir="PUT"
+        if len(closes)>=51:
             e50=_ema(closes,50)
             if e50:
-                if closes[-1]<e50 and trend_dir=="CALL": trend_dir="PUT"  # price below EMA50 → downtrend
-                if closes[-1]>e50 and trend_dir=="PUT":  trend_dir="CALL" # price above EMA50 → uptrend
+                if closes[-1]<e50 and trend_dir=="CALL": trend_dir="PUT"
+                if closes[-1]>e50 and trend_dir=="PUT":  trend_dir="CALL"
         # ───────────────────────────────────────────────────────────────────
 
         call_w=put_w=0.0; call_r=[]; put_r=[]; bc_call=bc_put=0
         call_count=put_count=0
-        # Counter-trend penalty: signals against the dominant trend get weight cut
-        counter_penalty=0.45 if crypto else 0.60
+        # In trending market: heavy penalty for counter-trend signals
+        # In ranging market: lighter penalty (reversals are expected)
+        if regime==RegimeDetector.TREND:
+            counter_penalty=0.35 if crypto else 0.50
+        else:
+            counter_penalty=0.65 if crypto else 0.75
+
         for d,conf,reason,name,w in results:
             score=(conf/100)*w
             if not adx_ok: score*=0.80
-            # Apply counter-trend penalty when a signal opposes the dominant trend
             if trend_dir and d!=trend_dir:
                 score*=counter_penalty
             if d=="CALL":
@@ -599,27 +709,34 @@ class StrategyEngine:
         total=call_w+put_w
         if total==0: return "CALL",52,"No Signal","Market",0
 
-        # Crypto: يحتاج إجماع أقوى + cap أقل
-        conf_cap=85 if crypto else 95
-        bonus_tiers=[(7,8),(5,5),(4,3)] if crypto else [(6,8),(4,5),(3,3)]
+        conf_cap=85 if crypto else 93
+        # Trending market: need fewer signals (trend is your friend)
+        # Ranging market: need more confirmation
+        if regime==RegimeDetector.TREND:
+            bonus_tiers=[(5,8),(4,5),(3,3)] if crypto else [(5,8),(4,5),(3,3)]
+            min_ratio=0.58
+        else:
+            bonus_tiers=[(6,6),(5,4),(4,2)] if crypto else [(5,6),(4,4),(3,2)]
+            min_ratio=0.62
 
         if call_w>=put_w:
-            ratio=call_w/total  # e.g. 0.70 = 70% of weighted votes are CALL
-            # Require at least 60% weighted majority for a confident signal
-            if ratio<0.55: return "CALL",52,"Weak Signal","Market",call_count
+            ratio=call_w/total
+            if ratio<min_ratio: return "CALL",52,f"Weak {self.last_regime}","Wait",call_count
             con=int(ratio*100); fin=min(conf_cap,int(con*0.5+bc_call*0.5))
             for thresh,bonus in bonus_tiers:
                 if call_count>=thresh: fin=min(conf_cap,fin+bonus); break
+            regime_tag=f"[{self.last_regime}]"
             strat=call_r[0].split(":")[0] if call_r else "Multi"
-            return "CALL",fin," | ".join(call_r[:4]),strat,call_count
+            return "CALL",fin,f"{regime_tag} "+" | ".join(call_r[:3]),strat,call_count
         else:
             ratio=put_w/total
-            if ratio<0.55: return "PUT",52,"Weak Signal","Market",put_count
+            if ratio<min_ratio: return "PUT",52,f"Weak {self.last_regime}","Wait",put_count
             con=int(ratio*100); fin=min(conf_cap,int(con*0.5+bc_put*0.5))
             for thresh,bonus in bonus_tiers:
                 if put_count>=thresh: fin=min(conf_cap,fin+bonus); break
+            regime_tag=f"[{self.last_regime}]"
             strat=put_r[0].split(":")[0] if put_r else "Multi"
-            return "PUT",fin," | ".join(put_r[:4]),strat,put_count
+            return "PUT",fin,f"{regime_tag} "+" | ".join(put_r[:3]),strat,put_count
 
     def _candle_patterns(self,cs,c1,c2,c3,c4):
         if len(cs)>=4:
@@ -1233,6 +1350,9 @@ class App:
         self.ml=MLPredictor(self.brain,self.risk)
         self.backtester=Backtester(self.engine)
         self.scanner=MultiPairScanner(self.engine)
+        self.pattern_validator=PatternValidator()
+        self._pending_signal=None   # (dir, conf, reason, strat, cf) waiting for confirmation
+        self._pending_candle=0      # candle index when pending signal was set
 
         self.direction=None; self.conf=0; self.reason=""; self.strat_name=""
         self.confluence=0; self.prev_price=None; self._last_diff=0
@@ -1625,20 +1745,48 @@ class App:
                 if ms_up   and d=="PUT"  and c<75: d="CALL"; c=max(52,c-10)
         # ────────────────────────────────────────────────────────────────────
 
+        # ── Signal Confirmation — wait for same signal on 2 candles ─────────
+        # High-confidence signals fire immediately; lower ones need confirmation
+        n_candles=self.builder.count()
+        if c>=75:
+            # Strong enough — use as-is, reset pending
+            self._pending_signal=None
+        else:
+            if self._pending_signal and self._pending_signal[0]==d:
+                # Same direction as pending — confirmed!
+                # Boost confidence slightly for confirmation
+                c=min(85 if is_crypto else 93, c+6)
+                self._pending_signal=None
+            else:
+                # New or changed signal — store as pending, show at reduced conf
+                self._pending_signal=(d,c,r,s,cf)
+                self._pending_candle=n_candles
+                c=max(50,c-8)   # show lower until confirmed
+        # ────────────────────────────────────────────────────────────────────
+
         # ── Consecutive Signal Lock ──────────────────────────────────────────
-        # If same direction repeats too many times, require higher confidence
         if d==self._consec_dir:
             self._consec_count+=1
         else:
             self._consec_dir=d; self._consec_count=1
         consec_limit=4 if is_crypto else 5
         if self._consec_count>consec_limit and c<72:
-            # Force a "waiting" state — signal too repetitive
-            d=self.direction; c=52; r="Waiting for new signal..."; s="Wait"; cf=0
+            d=self.direction or d; c=52; r="Waiting for new signal..."; s="Wait"; cf=0
+        # ────────────────────────────────────────────────────────────────────
+
+        # ── Pattern Validator — historical accuracy of current setup ─────────
+        if c>=65 and cf>=3 and len(cs)>=30:
+            acc,samples=self.pattern_validator.validate(self.engine,cs,d,crypto=is_crypto)
+            if samples>=5:
+                # Adjust confidence based on recent historical accuracy
+                # acc=0.70 → +5%, acc=0.50 → -8%, acc=0.35 → -15%
+                hist_adj=int((acc-0.55)*40)
+                c=max(52,min(85 if is_crypto else 93, c+hist_adj))
+                r=f"Hist:{int(acc*100)}% | {r}"
         # ────────────────────────────────────────────────────────────────────
 
         # Adjust by session + ADX
-        conf_cap=85 if is_crypto else 95
+        conf_cap=85 if is_crypto else 93
         c=max(50,min(conf_cap,int(c*smult)))
         if not adx_ok and self.adx_val is not None: c=int(c*0.80)
 
