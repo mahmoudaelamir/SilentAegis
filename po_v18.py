@@ -370,8 +370,15 @@ def _is_pin_bar(c,ratio=2.5):
     if uw>ratio*b and uw>lw*2: return "PUT"
     return None
 
-def session_quality():
-    h=datetime.datetime.utcnow().hour; active=[]
+def session_quality(is_crypto=False):
+    h=datetime.datetime.utcnow().hour
+    if is_crypto:
+        # BTC/ETH شغالين 24/7 — مفيش off-hours
+        if 12<=h<21: return 92,"NY Crypto ⚡",1.12
+        elif 7<=h<16: return 85,"LON Crypto",1.06
+        elif 0<=h<8:  return 78,"Asia Crypto",1.00
+        else:         return 75,"Crypto 24/7",0.95
+    active=[]
     if 7<=h<16:  active.append("London")
     if 12<=h<21: active.append("NewYork")
     if 0<=h<8 or h>=23: active.append("Tokyo")
@@ -486,43 +493,59 @@ class TelegramBot:
 #  Strategy Engine — 22 signal sources
 # ══════════════════════════════════════════════════════════
 class StrategyEngine:
+    # Forex weights
     W={
         "smc":2.5,"candle":2.2,"div":2.0,"sr":2.0,"mtf":2.1,
         "ichi":1.9,"ema":1.9,"fib":1.8,"bb":1.8,"macd":1.7,
         "rsi":1.6,"mom":1.6,"ha":1.6,"sto":1.5,"atr":1.5,
         "cci":1.5,"psar":1.4,"super":1.5,"will":1.4,
     }
+    # Crypto weights — trend-following أعلى، mean-reversion أقل
+    W_CRYPTO={
+        "smc":2.6,"candle":2.3,"div":2.4,"sr":2.1,"mtf":2.6,
+        "ichi":2.1,"ema":2.4,"fib":2.0,"bb":1.1,"macd":2.1,
+        "rsi":1.1,"mom":2.1,"ha":1.9,"sto":0.8,"atr":2.0,
+        "cci":0.9,"psar":1.7,"super":2.2,"will":0.8,
+    }
 
-    def run_all(self,candles):
+    def run_all(self,candles,crypto=False):
         if len(candles)<8: return "CALL",52,"Warming Up","System",0
         closes=[c["c"] for c in candles]
         highs =[c["h"] for c in candles]
         lows  =[c["l"] for c in candles]
         c1,c2,c3,c4=candles[-4],candles[-3],candles[-2],candles[-1]
-        adx_val=_adx(candles,14); adx_ok=adx_val is None or adx_val>=18
+
+        # Crypto يحتاج ADX أقوى (25+) بدل 18
+        adx_val=_adx(candles,14)
+        adx_thresh=25 if crypto else 18
+        adx_ok=adx_val is None or adx_val>=adx_thresh
+
+        W=self.W_CRYPTO if crypto else self.W
         results=[]
 
         def add(sig,group):
-            if sig: results.append((*sig,group,self.W[group]))
+            if sig: results.append((*sig,group,W[group]))
 
-        # SMC
+        # SMC — يشتغل بنفس الكفاءة مع الـ Crypto
         add(_liquidity_sweep(candles),"smc"); add(_order_blocks(candles),"smc")
         add(_fair_value_gap(candles),"smc"); add(_market_structure(candles),"smc")
         add(_supply_demand_zones(candles),"smc")
-        # Divergence (NEW)
+        # Divergence — أهم مع crypto
         add(_rsi_divergence(candles,closes),"div")
         add(_macd_divergence(closes),"div")
         # Candle Patterns
         add(self._candle_patterns(candles,c1,c2,c3,c4),"candle")
-        # Indicators
-        add(self._rsi_strat(closes),"rsi"); add(self._ema_cross(closes),"ema")
-        add(self._macd_strat(closes),"macd"); add(self._bb_strat(closes),"bb")
-        add(self._stoch_strat(highs,lows,closes),"sto")
+        # Indicators — crypto-aware thresholds
+        add(self._rsi_strat(closes,crypto),"rsi")
+        add(self._ema_cross(closes),"ema")
+        add(self._macd_strat(closes),"macd")
+        add(self._bb_strat(closes,crypto),"bb")
+        add(self._stoch_strat(highs,lows,closes,crypto),"sto")
         add(self._sr_pivot(closes,highs,lows,candles),"sr")
-        add(self._williams_strat(highs,lows,closes),"will")
+        add(self._williams_strat(highs,lows,closes,crypto),"will")
         add(self._cci_strat(highs,lows,closes),"cci")
-        add(self._momentum_trend(closes),"mom")
-        add(self._atr_breakout(candles,closes),"atr")
+        add(self._momentum_trend(closes,crypto),"mom")
+        add(self._atr_breakout(candles,closes,crypto),"atr")
         add(self._mtf_trend(closes),"mtf")
         # Advanced
         ichi=_ichimoku(candles)
@@ -530,8 +553,11 @@ class StrategyEngine:
             bull,bear,_,_=ichi
             if bull: add(("CALL",85,"Ichimoku Bull"),"ichi")
             elif bear: add(("PUT",85,"Ichimoku Bear"),"ichi")
-        add(_fibonacci(candles),"fib"); add(_supertrend(candles),"super")
-        add(_parabolic_sar(candles),"psar"); add(_heikin_ashi_trend(candles),"ha")
+        add(_fibonacci(candles),"fib")
+        # Supertrend: multiplier أكبر للـ crypto عشان BTC volatile
+        add(_supertrend(candles,period=10,multiplier=4.5 if crypto else 3.0),"super")
+        add(_parabolic_sar(candles),"psar")
+        add(_heikin_ashi_trend(candles),"ha")
 
         if not results:
             micro="CALL" if closes[-1]>=closes[-2] else "PUT"
@@ -541,7 +567,7 @@ class StrategyEngine:
         call_count=put_count=0
         for d,conf,reason,name,w in results:
             score=(conf/100)*w
-            if not adx_ok: score*=0.75
+            if not adx_ok: score*=0.80  # خصم أقل للـ crypto
             if d=="CALL":
                 call_w+=score; call_r.append(f"{name}:{conf}%")
                 bc_call=max(bc_call,conf); call_count+=1
@@ -552,18 +578,19 @@ class StrategyEngine:
         total=call_w+put_w
         if total==0: return "CALL",52,"No Signal","Market",0
 
+        # Crypto: يحتاج إجماع أقوى
+        bonus_tiers=[(7,10),(5,7),(4,5)] if crypto else [(6,8),(4,5),(3,3)]
+
         if call_w>=put_w:
             con=int((call_w/total)*100); fin=min(95,int(con*0.5+bc_call*0.5))
-            if call_count>=6: fin=min(95,fin+8)
-            elif call_count>=4: fin=min(95,fin+5)
-            elif call_count>=3: fin=min(95,fin+3)
+            for thresh,bonus in bonus_tiers:
+                if call_count>=thresh: fin=min(95,fin+bonus); break
             strat=call_r[0].split(":")[0] if call_r else "Multi"
             return "CALL",fin," | ".join(call_r[:4]),strat,call_count
         else:
             con=int((put_w/total)*100); fin=min(95,int(con*0.5+bc_put*0.5))
-            if put_count>=6: fin=min(95,fin+8)
-            elif put_count>=4: fin=min(95,fin+5)
-            elif put_count>=3: fin=min(95,fin+3)
+            for thresh,bonus in bonus_tiers:
+                if put_count>=thresh: fin=min(95,fin+bonus); break
             strat=put_r[0].split(":")[0] if put_r else "Multi"
             return "PUT",fin," | ".join(put_r[:4]),strat,put_count
 
@@ -594,16 +621,25 @@ class StrategyEngine:
             if c2["c"]>c2["o"] and c4["c"]<c4["o"]: return "PUT", 73,"Doji Rev↓"
         return None
 
-    def _rsi_strat(self,closes):
+    def _rsi_strat(self,closes,crypto=False):
         if len(closes)<15: return None
         rsi=_rsi(closes,14); rp=_rsi(closes[:-1],14)
         if rsi is None: return None
-        if rsi<22: return "CALL",88,f"RSI Oversold {rsi:.0f}"
-        if rsi>78: return "PUT", 88,f"RSI Overbought {rsi:.0f}"
-        if rsi<30: return "CALL",80,f"RSI Low {rsi:.0f}"
-        if rsi>70: return "PUT", 80,f"RSI High {rsi:.0f}"
-        if rp and rp<50<=rsi: return "CALL",72,"RSI Cross50↑"
-        if rp and rp>50>=rsi: return "PUT", 72,"RSI Cross50↓"
+        if crypto:
+            # BTC trends strongly — only extreme levels are meaningful
+            if rsi<15: return "CALL",90,f"RSI Extreme OS {rsi:.0f}"
+            if rsi>85: return "PUT", 90,f"RSI Extreme OB {rsi:.0f}"
+            if rsi<20: return "CALL",84,f"RSI Oversold {rsi:.0f}"
+            if rsi>80: return "PUT", 84,f"RSI Overbought {rsi:.0f}"
+            if rp and rp<50<=rsi: return "CALL",70,"RSI Cross50↑"
+            if rp and rp>50>=rsi: return "PUT", 70,"RSI Cross50↓"
+        else:
+            if rsi<22: return "CALL",88,f"RSI Oversold {rsi:.0f}"
+            if rsi>78: return "PUT", 88,f"RSI Overbought {rsi:.0f}"
+            if rsi<30: return "CALL",80,f"RSI Low {rsi:.0f}"
+            if rsi>70: return "PUT", 80,f"RSI High {rsi:.0f}"
+            if rp and rp<50<=rsi: return "CALL",72,"RSI Cross50↑"
+            if rp and rp>50>=rsi: return "PUT", 72,"RSI Cross50↓"
         return None
 
     def _ema_cross(self,closes):
@@ -645,25 +681,39 @@ class StrategyEngine:
         if hn<0 and hn<hp: return "PUT", 66,"MACD Mom↓"
         return None
 
-    def _bb_strat(self,closes):
+    def _bb_strat(self,closes,crypto=False):
         if len(closes)<21: return None
         up,mid,lo=_bollinger(closes,20)
         if None in (up,mid,lo): return None
         p=closes[-1]; bw=(up-lo)/mid
-        if p<=lo: return "CALL",min(92,74+int(bw*600)),f"BB Lower"
-        if p>=up: return "PUT", min(92,74+int(bw*600)),f"BB Upper"
-        if closes[-2]<mid<=p: return "CALL",66,"BB Mid↑"
-        if closes[-2]>mid>=p: return "PUT", 66,"BB Mid↓"
+        if crypto:
+            # BTC walks the band — require bounce confirmation (price was outside, now moving back)
+            if closes[-2]<=lo and p>lo: return "CALL",min(88,72+int(bw*500)),"BB Bounce↑"
+            if closes[-2]>=up and p<up: return "PUT", min(88,72+int(bw*500)),"BB Bounce↓"
+            if closes[-2]<mid<=p and p<up: return "CALL",63,"BB Mid↑"
+            if closes[-2]>mid>=p and p>lo: return "PUT", 63,"BB Mid↓"
+        else:
+            if p<=lo: return "CALL",min(92,74+int(bw*600)),"BB Lower"
+            if p>=up: return "PUT", min(92,74+int(bw*600)),"BB Upper"
+            if closes[-2]<mid<=p: return "CALL",66,"BB Mid↑"
+            if closes[-2]>mid>=p: return "PUT", 66,"BB Mid↓"
         return None
 
-    def _stoch_strat(self,highs,lows,closes):
+    def _stoch_strat(self,highs,lows,closes,crypto=False):
         if len(closes)<14: return None
         k=_stochastic(highs,lows,closes,14)
         if k is None: return None
-        if k<15: return "CALL",84,f"Stoch Oversold {k:.0f}"
-        if k>85: return "PUT", 84,f"Stoch Overbought {k:.0f}"
-        if k<25: return "CALL",76,f"Stoch Low {k:.0f}"
-        if k>75: return "PUT", 76,f"Stoch High {k:.0f}"
+        if crypto:
+            # BTC needs extreme levels to confirm reversals
+            if k<10: return "CALL",86,f"Stoch Extreme OS {k:.0f}"
+            if k>90: return "PUT", 86,f"Stoch Extreme OB {k:.0f}"
+            if k<15: return "CALL",76,f"Stoch Oversold {k:.0f}"
+            if k>85: return "PUT", 76,f"Stoch Overbought {k:.0f}"
+        else:
+            if k<15: return "CALL",84,f"Stoch Oversold {k:.0f}"
+            if k>85: return "PUT", 84,f"Stoch Overbought {k:.0f}"
+            if k<25: return "CALL",76,f"Stoch Low {k:.0f}"
+            if k>75: return "PUT", 76,f"Stoch High {k:.0f}"
         return None
 
     def _sr_pivot(self,closes,highs,lows,candles):
@@ -680,12 +730,19 @@ class StrategyEngine:
         if p>=res-m: return "PUT", 84,f"Resistance"
         return None
 
-    def _williams_strat(self,highs,lows,closes):
+    def _williams_strat(self,highs,lows,closes,crypto=False):
         if len(closes)<14: return None
         wr=_williams_r(highs,lows,closes,14)
         if wr is None: return None
-        if wr<-85: return "CALL",82,f"Williams OS {wr:.0f}"
-        if wr>-15: return "PUT", 82,f"Williams OB {wr:.0f}"
+        if crypto:
+            # Tighter extremes for BTC
+            if wr<-92: return "CALL",84,f"Williams Extreme OS {wr:.0f}"
+            if wr>-8:  return "PUT", 84,f"Williams Extreme OB {wr:.0f}"
+            if wr<-85: return "CALL",76,f"Williams OS {wr:.0f}"
+            if wr>-15: return "PUT", 76,f"Williams OB {wr:.0f}"
+        else:
+            if wr<-85: return "CALL",82,f"Williams OS {wr:.0f}"
+            if wr>-15: return "PUT", 82,f"Williams OB {wr:.0f}"
         return None
 
     def _cci_strat(self,highs,lows,closes):
@@ -698,24 +755,28 @@ class StrategyEngine:
         if cci>+100: return "PUT", 72,f"CCI High {cci:.0f}"
         return None
 
-    def _momentum_trend(self,closes):
+    def _momentum_trend(self,closes,crypto=False):
         if len(closes)<12: return None
         mom=_momentum(closes,10)
         if mom is None: return None
         e8=_ema(closes,8); e21=_ema(closes,21)
         au=e8 and e21 and e8>e21; ad=e8 and e21 and e8<e21
-        if mom>0.04 and au:  return "CALL",74,f"Momentum↑"
-        if mom<-0.04 and ad: return "PUT", 74,f"Momentum↓"
+        # BTC needs stronger momentum confirmation (0.15% vs 0.04%)
+        thresh=0.15 if crypto else 0.04
+        if mom>thresh and au:  return "CALL",78 if crypto else 74,f"Momentum↑ {mom:.2f}%"
+        if mom<-thresh and ad: return "PUT", 78 if crypto else 74,f"Momentum↓ {mom:.2f}%"
         return None
 
-    def _atr_breakout(self,candles,closes):
+    def _atr_breakout(self,candles,closes,crypto=False):
         if len(candles)<16: return None
         atr=_atr(candles,14)
         if not atr or atr==0: return None
         mv=abs(closes[-1]-closes[-2]); ratio=mv/atr
-        if ratio>2.0:
+        # BTC: 1.5x threshold (lower, since BTC makes frequent big moves)
+        thresh=1.5 if crypto else 2.0
+        if ratio>thresh:
             d="CALL" if closes[-1]>closes[-2] else "PUT"
-            return d,min(88,70+int(ratio*5)),f"ATR Breakout {ratio:.1f}x"
+            return d,min(90,70+int(ratio*5)),f"ATR Breakout {ratio:.1f}x"
         return None
 
     def _mtf_trend(self,closes):
@@ -1499,7 +1560,8 @@ class App:
         if n>=8:
             self._analyze()
             if new_candle:
-                d,c,r,s,cf=self.engine.run_all(self.builder.candles())
+                is_crypto=self.sym.startswith("BINANCE:")
+                d,c,r,s,cf=self.engine.run_all(self.builder.candles(),crypto=is_crypto)
                 self.pending_trades.append(
                     {"strat":s,"dir":d,"entry":p,"expiry":now+self.builder.dur-3})
 
@@ -1507,9 +1569,11 @@ class App:
         cs=self.builder.candles()
         if len(cs)<8: return
 
-        sq,sname,smult=session_quality()
+        is_crypto=self.sym.startswith("BINANCE:")
+        sq,sname,smult=session_quality(is_crypto=is_crypto)
         self.adx_val=_adx(cs,14)
-        adx_ok=self.adx_val is None or self.adx_val>=18
+        adx_thresh=25 if is_crypto else 18
+        adx_ok=self.adx_val is None or self.adx_val>=adx_thresh
 
         # News filter check
         blocked,news_msg=self.news.is_blocked()
@@ -1517,7 +1581,7 @@ class App:
         self.lbl_news.config(text=news_msg if blocked else "")
         self.lbl_next_news.config(text=next_ev)
 
-        d,c,r,s,cf=self.engine.run_all(cs)
+        d,c,r,s,cf=self.engine.run_all(cs,crypto=is_crypto)
 
         # Adjust by session + ADX
         c=max(50,min(95,int(c*smult)))
@@ -1559,8 +1623,9 @@ class App:
         self.lbl_best.config(text=self.brain.top3())
         self.lbl_besthour.config(text=self.risk.best_hour())
 
-        confl_clr="#00ff88" if cf>=5 else ("#ffaa00" if cf>=3 else "#666")
-        self.lbl_confl.config(text=f"CF:{cf} signals",fg=confl_clr)
+        cf_gate=4 if is_crypto else 3
+        confl_clr="#00ff88" if cf>=cf_gate+2 else ("#ffaa00" if cf>=cf_gate else "#666")
+        self.lbl_confl.config(text=f"CF:{cf} signals{'⚡' if is_crypto else ''}",fg=confl_clr)
 
         # Scanner row
         scan_txt=self.scanner.summary()
@@ -1582,9 +1647,9 @@ class App:
                                     "t":datetime.datetime.now().strftime("%H:%M"),"s":s})
             self.history=self.history[:6]
 
-        # Auto-entry
+        # Auto-entry — crypto needs stronger confluence (4+ signals)
         auto_min=self.v_min_conf_auto.get()
-        ok_conf=c>=auto_min; ok_cf=cf>=3
+        ok_conf=c>=auto_min; ok_cf=cf>=(4 if is_crypto else 3)
         ok_sess=sq>=55; ok_cb=not self.risk.circuit_break
         ok_profit=not self.risk.profit_locked
         ok_news=not blocked
