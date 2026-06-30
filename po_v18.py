@@ -1741,166 +1741,6 @@ def live_price(symbol):
     p=_exchangerate_price(symbol) # 4. Open ExchangeRate
     return p
 
-# ══════════════════════════════════════════════════════════
-#  Pocket Option WebSocket Integration (websocket-client)
-#  pip install websocket-client
-# ══════════════════════════════════════════════════════════
-try:
-    import websocket; WS_AVAILABLE=True
-except ImportError:
-    WS_AVAILABLE=False
-
-# Map our pair names → Pocket Option asset IDs
-PO_ASSET_MAP={
-    "EURUSD=X":"EURUSD_otc","GBPUSD=X":"GBPUSD_otc","USDJPY=X":"USDJPY_otc",
-    "AUDUSD=X":"AUDUSD_otc","GBPJPY=X":"GBPJPY_otc","EURJPY=X":"EURJPY_otc",
-    "USDCAD=X":"USDCAD_otc","USDCHF=X":"USDCHF_otc","NZDUSD=X":"NZDUSD_otc",
-    "BINANCE:BTCUSDT":"BTCUSD_otc","BINANCE:ETHUSDT":"ETHUSD_otc",
-    "GC=F":"XAUUSD_otc","CL=F":"USOIL_otc",
-}
-
-class PocketOptionTrader:
-    """
-    Direct WebSocket connection to Pocket Option using websocket-client.
-    No external API library needed — only websocket-client (pip install websocket-client).
-    """
-    WS_DEMO ="wss://demo-api-v2.po.market/socket.io/?EIO=4&transport=websocket"
-    WS_LIVE ="wss://api-v2.po.market/socket.io/?EIO=4&transport=websocket"
-
-    def __init__(self):
-        self.enabled=False
-        self.is_demo=True
-        self.ssid=None
-        self._ws=None
-        self._thread=None
-        self.status="Not connected"
-        self.balance=None
-        self._pending_orders={}   # {request_id: on_result_cb}
-        self._req_id=1
-        self._connected=False
-
-    def configure(self,ssid,is_demo=True):
-        self.ssid=ssid; self.is_demo=is_demo
-
-    def connect(self):
-        if not WS_AVAILABLE:
-            self.status="❌ Run: pip install websocket-client"; return False
-        if not self.ssid:
-            self.status="❌ No SSID entered"; return False
-        self._thread=threading.Thread(target=self._ws_loop,daemon=True)
-        self._thread.start()
-        # Wait up to 6s for connection
-        for _ in range(12):
-            if self._connected: return True
-            time.sleep(0.5)
-        return self._connected
-
-    def _ws_loop(self):
-        url=self.WS_DEMO if self.is_demo else self.WS_LIVE
-        # Send full ci_session cookie value as-is
-        self._ws=websocket.WebSocketApp(
-            url,
-            on_open   =self._on_open,
-            on_message=self._on_message,
-            on_error  =self._on_error,
-            on_close  =self._on_close,
-            header={"Cookie": f"ci_session={self.ssid}"}
-        )
-        self._ws.run_forever(ping_interval=20,ping_timeout=10)
-
-    def _on_open(self,ws):
-        # Send Socket.IO namespace connect immediately on open
-        ws.send("40")
-
-    def _on_message(self,ws,msg):
-        try:
-            if msg.startswith("0") and not msg.startswith("40"):
-                # Engine.IO open — namespace connect already sent in _on_open
-                pass
-            elif msg.startswith("40"):
-                # Namespace connected — now send auth event
-                auth_payload=json.dumps(["auth",{
-                    "session": self.ssid,
-                    "isDemo":  1 if self.is_demo else 0
-                }])
-                ws.send(f"42{auth_payload}")
-            elif msg.startswith("42"):
-                data=json.loads(msg[2:])
-                self._handle_event(data)
-            elif msg=="2":
-                ws.send("3")  # pong
-        except Exception:
-            pass
-
-    def _handle_event(self,data):
-        if not isinstance(data,list) or len(data)<2: return
-        event=data[0]; payload=data[1] if len(data)>1 else {}
-        if event=="successauth":
-            self._connected=True; self.enabled=True
-            self.status=f"✅ Auth OK ({'Demo' if self.is_demo else 'Live'})"
-        elif event=="updateBalance":
-            try: self.balance=float(payload.get("amount",0))
-            except: pass
-        elif event=="successopenOrder":
-            order_id=payload.get("id")
-            self.status=f"📤 Order #{order_id}"
-        elif event=="closedOrder" or event=="successcloseOrder":
-            order_id=payload.get("id")
-            profit=float(payload.get("profit",0))
-            outcome="WIN" if profit>0 else "LOSS"
-            self.status=f"{'✅' if outcome=='WIN' else '❌'} {outcome} ${abs(profit):.2f}"
-            cb=self._pending_orders.pop(order_id,None)
-            if cb: cb(outcome)
-
-    def _on_error(self,ws,err):
-        self.status=f"⚠ {str(err)[:50]}"
-        self._connected=False; self.enabled=False
-
-    def _on_close(self,ws,code,msg):
-        self._connected=False; self.enabled=False
-        self.status="Disconnected"
-
-    def place_order(self,asset_sym,amount,direction,duration,on_result=None):
-        if not self.enabled or not self._ws:
-            return False
-        po_asset=PO_ASSET_MAP.get(asset_sym,"EURUSD_otc")
-        action=1 if direction=="CALL" else 0
-        req_id=self._req_id; self._req_id+=1
-        msg=json.dumps(["sendMessage",{
-            "action":"openOrder",
-            "message":{
-                "asset":po_asset,
-                "amount":round(float(amount),2),
-                "action":action,
-                "isDemo":1 if self.is_demo else 0,
-                "requestId":req_id,
-                "optionType":100,   # binary
-                "time":duration
-            }
-        }])
-        try:
-            self._ws.send(f"42{msg}")
-            if on_result: self._pending_orders[req_id]=on_result
-            self.status=f"📤 {direction} ${amount} {po_asset}"
-            return True
-        except Exception as e:
-            self.status=f"⚠ {e}"; return False
-
-    def get_balance_sync(self):
-        if not self.enabled: return None
-        # Request balance update
-        try:
-            self._ws.send('42["sendMessage",{"action":"getBalance","message":{}}]')
-            time.sleep(1)
-        except: pass
-        return self.balance
-
-    def disconnect(self):
-        self.enabled=False; self._connected=False
-        if self._ws:
-            try: self._ws.close()
-            except: pass
-        self.status="Disconnected"
 
 # ══════════════════════════════════════════════════════════
 #  Main Application
@@ -1939,7 +1779,6 @@ class App:
         self.self_learner=SelfLearner(self.engine)
         self.adaptive_expiry=AdaptiveExpiry()
         self.smart_timer=SmartEntryTimer()
-        self.po_trader=PocketOptionTrader()
         threading.Thread(target=self._pro_data_loop,daemon=True).start()
 
         self.direction=None; self.conf=0; self.reason=""; self.strat_name=""
@@ -2099,13 +1938,8 @@ class App:
                   relief="flat",command=self._tg_settings).pack(side="left",padx=2)
         tk.Button(r3,text="BT",bg="#111",fg="#ff8800",font=("Consolas",7),
                   relief="flat",command=self._run_backtest).pack(side="left",padx=2)
-        tk.Button(r3,text="PO",bg="#111",fg="#a855f7",font=("Consolas",7,"bold"),
-                  relief="flat",command=self._po_settings).pack(side="left",padx=2)
         self.v_pair.trace("w",lambda *_:self._on_change())
         self.v_dur.trace("w", lambda *_:self._on_change())
-        self.lbl_po=tk.Label(c2,text="PO: Not connected",bg="#050810",fg="#555",
-                             font=("Consolas",6))
-        self.lbl_po.pack(anchor="w",padx=3)
         tk.Label(c2,text="● 22 Signals | OB | FR | OI | VWAP | Whale | F&G | MTF | DXY | Self-Learn",
                  bg="#050810",fg="#A78BFA",font=("Consolas",6,"bold")).pack(anchor="w",padx=3)
 
@@ -2198,87 +2032,6 @@ class App:
             self.risk.daily_loss=0; self.risk.daily_profit=0
             self.risk.profit_locked=False
         except: pass
-
-    def _po_settings(self):
-        win=tk.Toplevel(self.root)
-        win.title("Pocket Option API"); win.geometry("420x320")
-        win.configure(bg="#050810"); win.attributes("-topmost",True)
-        tk.Label(win,text="Pocket Option API Settings",bg="#050810",fg="#a855f7",
-                 font=("Consolas",10,"bold")).pack(pady=8)
-        frm=tk.Frame(win,bg="#050810"); frm.pack(fill="x",padx=16)
-
-        tk.Label(frm,text="Email:",bg="#050810",fg="#aaa",font=("Consolas",8)).grid(
-            row=0,column=0,sticky="w",pady=3)
-        v_email=tk.StringVar()
-        tk.Entry(frm,textvariable=v_email,width=30,bg="#111",fg="#fff",
-                 font=("Consolas",8)).grid(row=0,column=1,padx=4)
-
-        tk.Label(frm,text="Password:",bg="#050810",fg="#aaa",font=("Consolas",8)).grid(
-            row=1,column=0,sticky="w",pady=3)
-        v_pass=tk.StringVar()
-        tk.Entry(frm,textvariable=v_pass,width=30,bg="#111",fg="#fff",
-                 show="*",font=("Consolas",8)).grid(row=1,column=1,padx=4)
-
-        tk.Label(frm,text="SSID (or leave blank\nto auto-login):",bg="#050810",fg="#aaa",
-                 font=("Consolas",8),justify="left").grid(row=2,column=0,sticky="w",pady=3)
-        v_ssid=tk.StringVar()
-        tk.Entry(frm,textvariable=v_ssid,width=30,bg="#111",fg="#fff",
-                 font=("Consolas",8)).grid(row=2,column=1,padx=4)
-
-        v_demo=tk.BooleanVar(value=True)
-        tk.Checkbutton(frm,text="Demo Account",variable=v_demo,bg="#050810",
-                       fg="#ffaa00",font=("Consolas",8),selectcolor="#050810").grid(
-            row=3,column=0,columnspan=2,sticky="w",pady=3)
-
-        lbl_st=tk.Label(win,text="Status: Not connected",bg="#050810",fg="#555",
-                        font=("Consolas",8),wraplength=380)
-        lbl_st.pack(pady=4)
-
-        def _connect():
-            ssid=v_ssid.get().strip()
-            if not ssid:
-                lbl_st.config(text="❌ لازم تحط الـ SSID",fg="#ff4444")
-                return
-            if not WS_AVAILABLE:
-                lbl_st.config(text="❌ Run: pip install websocket-client",fg="#ff4444")
-                return
-            self.po_trader.configure(ssid,is_demo=v_demo.get())
-            lbl_st.config(text="🔄 Connecting...",fg="#ffaa00"); win.update()
-            def _do_connect():
-                ok=self.po_trader.connect()
-                win.after(0,lambda:lbl_st.config(
-                    text=self.po_trader.status,
-                    fg="#00ff88" if ok else "#ff4444"))
-                win.after(0,lambda:self.lbl_po.config(
-                    text=f"PO:{self.po_trader.status}",
-                    fg="#00ff88" if ok else "#ff4444"))
-                if ok:
-                    bal=self.po_trader.get_balance_sync()
-                    if bal:
-                        win.after(0,lambda:lbl_st.config(
-                            text=f"{self.po_trader.status} | Balance: ${bal:.2f}",
-                            fg="#00ff88"))
-            threading.Thread(target=_do_connect,daemon=True).start()
-
-        def _disconnect():
-            self.po_trader.disconnect()
-            lbl_st.config(text="Disconnected",fg="#555")
-            self.lbl_po.config(text="PO: Not connected",fg="#555")
-
-        def _check_bal():
-            bal=self.po_trader.get_balance_sync()
-            if bal: lbl_st.config(text=f"Balance: ${bal:.2f}",fg="#00ff88")
-            else: lbl_st.config(text="Not connected",fg="#555")
-
-        br=tk.Frame(win,bg="#050810"); br.pack(pady=6)
-        tk.Button(br,text="Connect",bg="#0a1a0a",fg="#00ff88",font=("Consolas",9,"bold"),
-                  relief="flat",command=_connect,padx=10,pady=4).pack(side="left",padx=4)
-        tk.Button(br,text="Balance",bg="#111",fg="#ffaa00",font=("Consolas",9),
-                  relief="flat",command=_check_bal,padx=8,pady=4).pack(side="left",padx=4)
-        tk.Button(br,text="Disconnect",bg="#1a0a0a",fg="#ff4444",font=("Consolas",9),
-                  relief="flat",command=_disconnect,padx=8,pady=4).pack(side="left",padx=4)
-        tk.Label(win,text="⚠ SSID = القيمة الكاملة لـ ci_session من Cookies (F12 → Application → Cookies → انسخ Value كاملاً)",
-                 bg="#050810",fg="#445",font=("Consolas",6),wraplength=400).pack(pady=2)
 
     def _tg_settings(self):
         win=tk.Toplevel(self.root)
@@ -2599,32 +2352,9 @@ class App:
             if self.last_clicked_bnd!=bnd:
                 self.last_clicked_bnd=bnd
 
-                # ── PO API: place order directly if connected ─────────────
-                if self.po_trader.enabled:
-                    def _on_result(outcome):
-                        self.root.after(0,lambda:self.log(outcome))
-                        self.root.after(0,lambda:self.lbl_po.config(
-                            text=f"PO:{'✅WIN' if outcome=='WIN' else '❌LOSS'}",
-                            fg="#00ff88" if outcome=="WIN" else "#ff4444"))
-                    placed=self.po_trader.place_order(
-                        asset_sym=self.sym,
-                        amount=bet,
-                        direction=d,
-                        duration=self.builder.dur,
-                        on_result=_on_result)
-                    if placed:
-                        self.lbl_po.config(text=f"PO:📤 {d} ${bet}",fg="#a855f7")
-                    else:
-                        # Fallback to auto-clicker if PO API placement failed
-                        tgt=self.call_tgt if d=="CALL" else self.put_tgt
-                        cx,cy=tgt.center()
-                        threading.Thread(target=fire_click,args=(tgt,cx,cy),daemon=True).start()
-                else:
-                    # PO API not connected — use auto-clicker as before
-                    tgt=self.call_tgt if d=="CALL" else self.put_tgt
-                    cx,cy=tgt.center()
-                    threading.Thread(target=fire_click,args=(tgt,cx,cy),daemon=True).start()
-                # ─────────────────────────────────────────────────────────
+                tgt=self.call_tgt if d=="CALL" else self.put_tgt
+                cx,cy=tgt.center()
+                threading.Thread(target=fire_click,args=(tgt,cx,cy),daemon=True).start()
 
                 # Telegram signal
                 self.tg.send_signal(d,c,r,self.v_pair.get(),bet,cf)
