@@ -563,11 +563,32 @@ class StrategyEngine:
             micro="CALL" if closes[-1]>=closes[-2] else "PUT"
             return micro,52,"Live Pulse","Micro",0
 
+        # ── Trend Alignment Filter ──────────────────────────────────────────
+        # Determine dominant short-term trend from EMAs
+        trend_dir=None
+        if len(closes)>=22:
+            e8=_ema(closes,8); e21=_ema(closes,21)
+            if e8 and e21:
+                if e8>e21*1.0005: trend_dir="CALL"   # clear uptrend
+                elif e8<e21*0.9995: trend_dir="PUT"  # clear downtrend
+        # For crypto also check EMA50 for stronger confirmation
+        if crypto and len(closes)>=51:
+            e50=_ema(closes,50)
+            if e50:
+                if closes[-1]<e50 and trend_dir=="CALL": trend_dir="PUT"  # price below EMA50 → downtrend
+                if closes[-1]>e50 and trend_dir=="PUT":  trend_dir="CALL" # price above EMA50 → uptrend
+        # ───────────────────────────────────────────────────────────────────
+
         call_w=put_w=0.0; call_r=[]; put_r=[]; bc_call=bc_put=0
         call_count=put_count=0
+        # Counter-trend penalty: signals against the dominant trend get weight cut
+        counter_penalty=0.45 if crypto else 0.60
         for d,conf,reason,name,w in results:
             score=(conf/100)*w
-            if not adx_ok: score*=0.80  # خصم أقل للـ crypto
+            if not adx_ok: score*=0.80
+            # Apply counter-trend penalty when a signal opposes the dominant trend
+            if trend_dir and d!=trend_dir:
+                score*=counter_penalty
             if d=="CALL":
                 call_w+=score; call_r.append(f"{name}:{conf}%")
                 bc_call=max(bc_call,conf); call_count+=1
@@ -578,19 +599,25 @@ class StrategyEngine:
         total=call_w+put_w
         if total==0: return "CALL",52,"No Signal","Market",0
 
-        # Crypto: يحتاج إجماع أقوى
-        bonus_tiers=[(7,10),(5,7),(4,5)] if crypto else [(6,8),(4,5),(3,3)]
+        # Crypto: يحتاج إجماع أقوى + cap أقل
+        conf_cap=85 if crypto else 95
+        bonus_tiers=[(7,8),(5,5),(4,3)] if crypto else [(6,8),(4,5),(3,3)]
 
         if call_w>=put_w:
-            con=int((call_w/total)*100); fin=min(95,int(con*0.5+bc_call*0.5))
+            ratio=call_w/total  # e.g. 0.70 = 70% of weighted votes are CALL
+            # Require at least 60% weighted majority for a confident signal
+            if ratio<0.55: return "CALL",52,"Weak Signal","Market",call_count
+            con=int(ratio*100); fin=min(conf_cap,int(con*0.5+bc_call*0.5))
             for thresh,bonus in bonus_tiers:
-                if call_count>=thresh: fin=min(95,fin+bonus); break
+                if call_count>=thresh: fin=min(conf_cap,fin+bonus); break
             strat=call_r[0].split(":")[0] if call_r else "Multi"
             return "CALL",fin," | ".join(call_r[:4]),strat,call_count
         else:
-            con=int((put_w/total)*100); fin=min(95,int(con*0.5+bc_put*0.5))
+            ratio=put_w/total
+            if ratio<0.55: return "PUT",52,"Weak Signal","Market",put_count
+            con=int(ratio*100); fin=min(conf_cap,int(con*0.5+bc_put*0.5))
             for thresh,bonus in bonus_tiers:
-                if put_count>=thresh: fin=min(95,fin+bonus); break
+                if put_count>=thresh: fin=min(conf_cap,fin+bonus); break
             strat=put_r[0].split(":")[0] if put_r else "Multi"
             return "PUT",fin," | ".join(put_r[:4]),strat,put_count
 
